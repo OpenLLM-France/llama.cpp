@@ -9825,6 +9825,10 @@ class NemotronModel(TextModel):
         if name.endswith("norm.weight"):
             data_torch = data_torch + 1
 
+        # for tied embeddings, duplicate token_embd as output.weight
+        if self.hparams.get("tie_word_embeddings", False) and name == "model.embed_tokens.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT), data_torch)
+
         yield from super().modify_tensors(data_torch, name, bid)
 
 
