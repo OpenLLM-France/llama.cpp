@@ -10279,7 +10279,7 @@ class NemotronHModel(GraniteHybridModel):
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
 
-        self.is_luciole = hparams.get("hybrid_override_pattern", "") == "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
+        self.is_luciole = hparams.get("bos_token_id", -1) == 0
 
         super().__init__(*args, **kwargs)
 
