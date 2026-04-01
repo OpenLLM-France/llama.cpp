@@ -9775,6 +9775,19 @@ class ChatGLMModel(TextModel):
 
 
 LUCIOLE_TO_BPE = False
+def set_vocab_luciole(self):
+    # Luciole
+    if LUCIOLE_TO_BPE:
+        tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
+        self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
+        self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
+    else:
+        tokens = self._set_vocab_bpe_as_spm()
+        self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
+        self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
+    self.gguf_writer.add_add_space_prefix(True)
+
+
 @ModelBase.register("NemotronForCausalLM")
 class NemotronModel(TextModel):
     model_arch = gguf.MODEL_ARCH.NEMOTRON
@@ -9785,16 +9798,7 @@ class NemotronModel(TextModel):
             self.gguf_writer.add_pad_token_id(0)
             self.gguf_writer.add_unk_token_id(1)
         else:
-            # Luciole
-            if LUCIOLE_TO_BPE:
-                tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
-                self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
-                self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
-            else:
-                tokens = self._set_vocab_bpe_as_spm()
-                self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
-                self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
-            self.gguf_writer.add_add_space_prefix(True)
+            set_vocab_luciole(self)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -10275,6 +10279,8 @@ class NemotronHModel(GraniteHybridModel):
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
 
+        self.is_luciole = hparams.get("hybrid_override_pattern", "") == "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
+
         super().__init__(*args, **kwargs)
 
         # Save the top-level head_dim for later
@@ -10348,6 +10354,10 @@ class NemotronHModel(GraniteHybridModel):
                 self.gguf_writer.add_moe_latent_size(latent_size)
 
     def set_vocab(self):
+        if self.is_luciole:
+            set_vocab_luciole(self)
+            return
+
         super().set_vocab()
 
         # The tokenizer _does_ add a BOS token (via post_processor type
