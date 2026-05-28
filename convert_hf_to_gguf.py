@@ -9777,14 +9777,33 @@ class ChatGLMModel(TextModel):
 LUCIOLE_TO_BPE = False
 def set_vocab_luciole(self):
     # Luciole
-    if LUCIOLE_TO_BPE:
-        tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
-        self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
-        self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
-    else:
-        tokens = self._set_vocab_bpe_as_spm()
-        self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
-        self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
+    # Promote every entry of added_tokens_decoder to a control token, even those
+    # flagged "special": false in tokenizer_config.json (e.g. <tool_call>,
+    # </tool_call>, <tool_response>, </tool_response>). Otherwise llama.cpp's
+    # tokenizer BPE-splits them at inference, diverging from training.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+    added_token_texts = {info.content for info in tokenizer.added_tokens_decoder.values()}
+    original_does_token_look_special = self.does_token_look_special
+
+    def does_token_look_special_with_added(token):
+        token_text = token.decode("utf-8") if isinstance(token, (bytes, bytearray)) else token
+        if token_text in added_token_texts:
+            return True
+        return original_does_token_look_special(token)
+
+    self.does_token_look_special = does_token_look_special_with_added
+    try:
+        if LUCIOLE_TO_BPE:
+            tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
+            self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
+            self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
+        else:
+            tokens = self._set_vocab_bpe_as_spm()
+            self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
+            self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
+    finally:
+        self.does_token_look_special = original_does_token_look_special
     self.gguf_writer.add_add_space_prefix(True)
 
 
@@ -9832,6 +9851,10 @@ class NemotronModel(TextModel):
         # for tied embeddings, duplicate token_embd as output.weight
         if self.hparams.get("tie_word_embeddings", False) and name == "model.embed_tokens.weight":
             yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT), data_torch)
+
+        # skip lm_head.weight if tie_word_embeddings is True (already emitted from embed_tokens above)
+        if self.hparams.get("tie_word_embeddings", False) and name == "lm_head.weight":
+            return
 
         yield from super().modify_tensors(data_torch, name, bid)
 
