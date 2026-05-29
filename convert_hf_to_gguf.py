@@ -9845,8 +9845,12 @@ class NemotronModel(TextModel):
         #   model.layers.{l}.input_layernorm.weight
         #   model.layers.{l}.post_attention_layernorm.weight
         #   model.norm.weight
+        # NOTE: cast to fp32 BEFORE the +1 — source weights are bf16/fp16 and the
+        # add would otherwise happen at the source dtype, quantizing γ by ~3.9e-3
+        # (bf16) / ~9.8e-4 (fp16) per element. GGUF stores these tensors as F32,
+        # so doing the arithmetic at full precision is free.
         if name.endswith("norm.weight"):
-            data_torch = data_torch + 1
+            data_torch = data_torch.float() + 1
 
         # for tied embeddings, duplicate token_embd as output.weight
         if self.hparams.get("tie_word_embeddings", False) and name == "model.embed_tokens.weight":
