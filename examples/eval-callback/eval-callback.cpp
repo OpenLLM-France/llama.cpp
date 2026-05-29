@@ -15,7 +15,14 @@ static bool run(llama_context * ctx, const common_params & params) {
 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos);
+    // Opt-in atomic tokenization of control strings: set
+    // LLAMA_TOKENIZE_PARSE_SPECIAL=1 to make chat-template tokens like
+    // <|im_start|> / <|im_end|> / <tool_call> tokenize as a single id instead
+    // of being byte-split. Default behaviour (env var unset) is unchanged.
+    const char * env_parse_special = std::getenv("LLAMA_TOKENIZE_PARSE_SPECIAL");
+    const bool parse_special = env_parse_special != nullptr &&
+                               env_parse_special[0] != '\0' && env_parse_special[0] != '0';
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, parse_special);
 
     if (tokens.empty()) {
         LOG_ERR("%s : there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
