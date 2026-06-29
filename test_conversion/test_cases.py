@@ -250,4 +250,34 @@ TEST_CASES = [
         ],
         "tools": [WEATHER_TOOL, CALCULATOR_TOOL],
     },
+    # --- Multi-turn (user/assistant/user/assistant/user), tokenization-focused ---
+    # Mixes French accents, an apostrophe word ("l'Allemagne"), a code fence
+    # and a Markdown inline code span — designed to surface BPE / special-token
+    # boundary divergences between the HF tokenizer and llama.cpp's SPM.
+    {
+        "name": "11_multi_turn_tokenization",
+        "messages": [
+            {"role": "user", "content": "Quelle heure est-il à Paris ?"},
+            {"role": "assistant", "content": "Il est 14h30 (heure de Paris)."},
+            {"role": "user", "content": "Montre-moi `int x = 42;` dans un bloc Markdown."},
+            {"role": "assistant", "content": "```cpp\nint x = 42;\n```"},
+            {"role": "user", "content": "Merci !"},
+        ],
+        "tools": None,
+    },
+    # --- Multi-turn (user/assistant/user/assistant/user), logit-focused ---
+    # Short factual conversation ending on a question whose answer is a single
+    # well-known proper noun ("Madrid"), so the next-token top-K distribution
+    # should be sharply peaked and easy to compare across runtimes.
+    {
+        "name": "12_multi_turn_logit",
+        "messages": [
+            {"role": "user", "content": "Quelle est la capitale de la France ?"},
+            {"role": "assistant", "content": "La capitale de la France est Paris."},
+            {"role": "user", "content": "Et celle de l'Allemagne ?"},
+            {"role": "assistant", "content": "Berlin."},
+            {"role": "user", "content": "Et celle de l'Espagne ?"},
+        ],
+        "tools": None,
+    },
 ]
