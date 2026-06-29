@@ -1625,7 +1625,15 @@ class TextModel(ModelBase):
                 if info.special or self.does_token_look_special(token_text):
                     tokens[token_id] = token_text.encode("utf-8")
                     scores[token_id] = 0.0
-                    toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+                    # USER_DEFINED instead of CONTROL: USER_DEFINED tokens are
+                    # always pre-extracted atomically by llama.cpp's tokenizer
+                    # (see llama-vocab.cpp:tokenizer_st_partition), whereas
+                    # CONTROL tokens are only matched when the caller passes
+                    # parse_special=true. Some runtimes (notably Ollama in
+                    # /api/generate raw=true mode) leave parse_special=false,
+                    # which would BPE-split tokens like <|im_start|> into ~12
+                    # pieces. USER_DEFINED avoids that and matches HF behavior.
+                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
                     continue
 
             # Check if this is a byte fallback token (<0xHH>) or a single-byte token
@@ -9777,10 +9785,13 @@ class ChatGLMModel(TextModel):
 LUCIOLE_TO_BPE = False
 def set_vocab_luciole(self):
     # Luciole
-    # Promote every entry of added_tokens_decoder to a control token, even those
+    # Promote every entry of added_tokens_decoder to an atomic token, even those
     # flagged "special": false in tokenizer_config.json (e.g. <tool_call>,
-    # </tool_call>, <tool_response>, </tool_response>). Otherwise llama.cpp's
-    # tokenizer BPE-splits them at inference, diverging from training.
+    # </tool_call>, <tool_response>, </tool_response>). _set_vocab_bpe_as_spm
+    # then marks them USER_DEFINED, which means llama.cpp pre-extracts them
+    # atomically regardless of the runtime's parse_special flag — important
+    # because Ollama's /api/generate raw=true mode runs with parse_special=false
+    # and would otherwise BPE-split <|im_start|> into ~12 byte tokens.
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
     added_token_texts = {info.content for info in tokenizer.added_tokens_decoder.values()}
@@ -9804,6 +9815,13 @@ def set_vocab_luciole(self):
             self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
     finally:
         self.does_token_look_special = original_does_token_look_special
+    # add_space_prefix=True so raw text like "Hello world" tokenizes to
+    # ['▁Hello', '▁world'] (matching HF). Note: llama.cpp's flag is binary,
+    # while HF uses prepend_scheme="first" — so for chat-templated inputs we
+    # accept a small (+1 token per special-token boundary) divergence, since
+    # llama.cpp will also insert `▁` after each <|im_start|>/<|im_end|>/tool
+    # tag where HF would not. The raw-text match is the bigger correctness
+    # win and is what tests/test-tokenizer-random.py verifies.
     self.gguf_writer.add_add_space_prefix(True)
 
 
@@ -9852,7 +9870,11 @@ class NemotronModel(TextModel):
         if name.endswith("norm.weight"):
             data_torch = data_torch.float() + 1
 
-        # for tied embeddings, duplicate token_embd as output.weight
+        # for tied embeddings, duplicate token_embd as output.weight.
+        # NOTE: upstream llama.cpp's NEMOTRON loader treats output.weight as
+        # required (unlike NEMOTRON_H, which falls back to token_embd), so the
+        # duplicate must be present in the GGUF — it costs ~vocab*n_embd bytes
+        # but is necessary for the model to load on stock llama.cpp.
         if self.hparams.get("tie_word_embeddings", False) and name == "model.embed_tokens.weight":
             yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT), data_torch)
 
