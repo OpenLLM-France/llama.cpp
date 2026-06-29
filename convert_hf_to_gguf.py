@@ -9815,14 +9815,14 @@ def set_vocab_luciole(self):
             self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
     finally:
         self.does_token_look_special = original_does_token_look_special
-    # add_space_prefix=True so raw text like "Hello world" tokenizes to
-    # ['▁Hello', '▁world'] (matching HF). Note: llama.cpp's flag is binary,
-    # while HF uses prepend_scheme="first" — so for chat-templated inputs we
-    # accept a small (+1 token per special-token boundary) divergence, since
-    # llama.cpp will also insert `▁` after each <|im_start|>/<|im_end|>/tool
-    # tag where HF would not. The raw-text match is the bigger correctness
-    # win and is what tests/test-tokenizer-random.py verifies.
-    self.gguf_writer.add_add_space_prefix(True)
+    # add_space_prefix=False because HF's metaspace prepend_scheme="first"
+    # only inserts `▁` at the very start of the input, while llama.cpp's flag
+    # is binary and would insert `▁` after EVERY special token (so
+    # <|im_start|>system → '<|im_start|>', '▁system' instead of the expected
+    # '<|im_start|>', 'system'). Since the model is only ever fed chat-
+    # templated inputs with many special-token boundaries, the per-boundary
+    # divergence is much more harmful than the raw-text leading-space miss.
+    self.gguf_writer.add_add_space_prefix(False)
 
 
 @ModelBase.register("NemotronForCausalLM")
