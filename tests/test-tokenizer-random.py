@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 import logging
 import argparse
+import itertools
 import subprocess
 import random
 import unicodedata
@@ -150,14 +151,24 @@ class TokenizerGroundtruth (Tokenizer):
         self.bos_token = self.model.bos_token
         self.eos_token = self.model.eos_token
 
-    def encode(self, text: str) -> list[int]:
-        return self.model.encode(text, add_special_tokens=True)
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        return self.model.encode(text, add_special_tokens=add_special)
 
     def decode(self, ids: list[int]) -> str:
         return self.model.decode(ids, skip_special_tokens=False)
-    
+
     def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
         return self.model.convert_ids_to_tokens(ids)
+
+    def has_chat_template(self) -> bool:
+        return bool(getattr(self.model, "chat_template", None))
+
+    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
+        return self.model.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
 
 
 class TokenizerLlamaCpp (Tokenizer):
@@ -169,8 +180,8 @@ class TokenizerLlamaCpp (Tokenizer):
             self.libllama = LibLlama()
         self.model = LibLlamaModel(self.libllama, vocab_file, mparams=dict(vocab_only=True), cparams=dict(n_ctx=4096))
 
-    def encode(self, text: str) -> list[int]:
-        return self.model.tokenize(text, add_special=True, parse_special=True)
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        return self.model.tokenize(text, add_special=add_special, parse_special=True)
 
     def decode(self, ids: list[int]) -> str:
         return self.model.detokenize(ids, remove_special=False, unparse_special=True)
@@ -433,7 +444,59 @@ def generator_random_vocab_words(tokenizer: TokenizerGroundtruth, iterations=100
         yield "".join(text)
 
 
-def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLlamaCpp, generator: Iterator[str]):
+def generator_chat_wrap(generator: Iterator[str], tokenizer: TokenizerGroundtruth) -> Iterator[str]:
+    """Wrap each yielded text as a single user-turn chat template, with add_generation_prompt=True."""
+    for text in generator:
+        messages = [{"role": "user", "content": text}]
+        try:
+            yield tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        except Exception as e:
+            logger.debug(f"chat template skipped for {repr(text)[:60]}: {e}")
+            continue
+
+
+def _collect_texts(source: Iterator[str], limit: int = 2048) -> list[str]:
+    out: list[str] = []
+    for text in source:
+        if not isinstance(text, str):
+            continue
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def generator_random_chat_multiturn(
+    tokenizer: TokenizerGroundtruth,
+    text_pool_source: Iterator[str],
+    iterations: int = 500,
+    max_turns: int = 11,
+) -> Iterator[str]:
+    """Random multi-turn conversations [user, assistant, user, ..., user] with add_generation_prompt=True.
+
+    The conversation always ends on a user message (odd number of turns).
+    """
+    texts = _collect_texts(text_pool_source)
+    if not texts:
+        return
+    rand = random.Random()
+    for m in range(iterations):
+        rand.seed(m)
+        num_turns = rand.randint(1, max_turns)
+        if num_turns % 2 == 0:
+            num_turns += 1  # ensure odd → ends on user
+        messages = []
+        for i in range(num_turns):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": rand.choice(texts)})
+        try:
+            yield tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        except Exception as e:
+            logger.debug(f"multiturn chat template failed at iter {m} (turns={num_turns}): {e}")
+            continue
+
+
+def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLlamaCpp, generator: Iterator[str], add_special: bool = True):
 
     def find_first_mismatch(ids1: list[int] | str, ids2: list[int] | str):
         for i, (a, b) in enumerate(zip(ids1, ids2)):
@@ -469,9 +532,9 @@ def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLl
         # print(repr(text), text.encode())
         # print(repr(text), hex(ord(text[0])), text.encode())
         t0 = time.perf_counter()
-        ids1 = tokenizer1.encode(text)
+        ids1 = tokenizer1.encode(text, add_special=add_special)
         t1 = time.perf_counter()
-        ids2 = tokenizer2.encode(text)
+        ids2 = tokenizer2.encode(text, add_special=add_special)
         t2 = time.perf_counter()
         text1 = tokenizer1.decode(ids1)
         t3 = time.perf_counter()
@@ -518,6 +581,19 @@ def main(argv: list[str] | None = None):
     parser.add_argument("vocab_file", type=str, help="path to vocab 'gguf' file")
     parser.add_argument("dir_tokenizer", type=str, help="directory containing 'tokenizer.model' file")
     parser.add_argument("--verbose", action="store_true", help="increase output verbosity")
+    parser.add_argument(
+        "--chat_template",
+        type=str,
+        choices=["true", "false"],
+        default=None,
+        help=(
+            "Wrap each test input in the model's chat template before tokenizing. "
+            "'true' requires the tokenizer to define a chat template (fails otherwise) and "
+            "also runs multi-turn conversation tests. "
+            "'false' tests raw inputs (legacy behavior). "
+            "If omitted, defaults to 'true' when a chat template is present, else 'false'."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level = logging.DEBUG if args.verbose else logging.INFO)
@@ -526,20 +602,85 @@ def main(argv: list[str] | None = None):
     tokenizer1 = TokenizerGroundtruth(args.dir_tokenizer)
     tokenizer2 = TokenizerLlamaCpp(args.vocab_file)
 
-    compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_digit())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_contractions())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text_edge_cases())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_ascii_lr_strip())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_apostrophe())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_unicodes())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_vocab_words(tokenizer1))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_added_lr_strip(tokenizer1))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_random_added_tokens(tokenizer1, 10_000))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_random_chars(10_000))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_random_unicodes(10_000))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_chars(tokenizer1, 10_000))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_words(tokenizer1, 5_000))
+    has_template = tokenizer1.has_chat_template()
+    if args.chat_template is None:
+        use_chat_template = has_template
+    elif args.chat_template == "true":
+        if not has_template:
+            raise ValueError(
+                "--chat_template true was requested but the tokenizer at "
+                f"'{args.dir_tokenizer}' has no chat_template set."
+            )
+        use_chat_template = True
+    else:
+        use_chat_template = False
+
+    logger.info(
+        f"chat_template: {'ENABLED' if use_chat_template else 'DISABLED'} "
+        f"(tokenizer {'has' if has_template else 'has NO'} template; "
+        f"--chat_template={args.chat_template})"
+    )
+
+    if not use_chat_template:
+        compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_digit())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_contractions())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text_edge_cases())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_ascii_lr_strip())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_apostrophe())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_unicodes())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_vocab_words(tokenizer1))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_added_lr_strip(tokenizer1))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_added_tokens(tokenizer1, 10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_chars(10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_unicodes(10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_chars(tokenizer1, 10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_words(tokenizer1, 5_000))
+    else:
+        # Chat-templated single-turn runs. The chat template already injects BOS/special
+        # tokens as needed, so we disable add_special on both tokenizers to avoid
+        # double-BOS and to keep the inputs strictly identical.
+        #
+        # Each yielded item costs ~10–100x more than in raw mode (Jinja template render +
+        # tokenization of the full templated string), so we cap exhaustive generators and
+        # use smaller iteration counts for the random ones. The chat-template prefix is
+        # identical across items, so sampling gives equivalent coverage to enumeration.
+        CHAT_CAP = 2_000
+        CHAT_RAND_ITER = 1_000
+
+        def _wrap(gen, cap=CHAT_CAP):
+            if cap is not None:
+                gen = itertools.islice(gen, cap)
+            return generator_chat_wrap(gen, tokenizer1)
+
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_custom_text()),                                        add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_digit()),                                              add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_contractions()),                                       add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_custom_text_edge_cases()),                             add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_ascii_lr_strip()),                                     add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_apostrophe()),                                         add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_unicodes()),                                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_vocab_words(tokenizer1)),                              add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_added_lr_strip(tokenizer1)),                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_added_tokens(tokenizer1, CHAT_RAND_ITER)),      add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_chars(CHAT_RAND_ITER)),                         add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_unicodes(CHAT_RAND_ITER)),                      add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_vocab_chars(tokenizer1, CHAT_RAND_ITER)),       add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_vocab_words(tokenizer1, CHAT_RAND_ITER)),       add_special=False)
+
+        # Multi-turn conversation tests (alternating user/assistant, ending on user).
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_custom_text(), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_chars(500), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_unicodes(500), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_vocab_words(tokenizer1, 500), iterations=500),
+                           add_special=False)
 
     tokenizer2.model.free()
 
