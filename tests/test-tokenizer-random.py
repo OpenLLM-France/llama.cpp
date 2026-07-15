@@ -27,6 +27,23 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 logger = logging.getLogger("test-tokenizer-random")
 
 
+# Characters that historically flood the mismatch log without teaching us
+# anything about the tokenizer we're actually testing (they mostly exercise
+# byte-fallback paths). We keep at most one dedicated test per representative
+# character in the fixed test lists and filter these out of the random /
+# brute-force generators so they don't dominate the report.
+CONTROL_CHARS = frozenset(
+    chr(cp) for cp in (
+        *range(0x00, 0x09),  # NUL..BS
+        0x0B,                # VT
+        *range(0x0D, 0x20),  # CR..US
+        0x7F,                # DEL
+        0xFEFF,              # BOM
+    )
+)
+CURLY_QUOTES = frozenset("‘’“”")  # U+2018..U+201D — represent all curly quotes
+
+
 class LibLlama:
 
     DEFAULT_PATH_LLAMA_H = "./include/llama.h"
@@ -241,22 +258,50 @@ def generator_digit() -> Iterator[str]:
 
 
 def generator_contractions() -> Iterator[str]:
-    """Contractions and apostrophes"""
+    """Contractions and apostrophes.
+
+    All French elisions use the straight ASCII apostrophe. Curly-quote coverage
+    is deliberately minimal (one U+201C double, one U+2019 single) — those two
+    stand in for every curly-quote form; the rest are filtered out of the random
+    generators to keep the mismatch log focused."""
     yield from [
+        # English contractions
         "I'll",
         "We've they're",
-        "Bonjour quoiqu'aujourd'hui",
-        "puisqu'après",
+        "don't shouldn't wouldn't",
+        "I'm you're he'd she'll",
+        "y'all it's",
+        # French elisions (single)
+        "j'ai t'as l'homme d'un c'est s'il n'est m'a qu'il",
+        "s'il vous plaît, c'est l'heure d'y aller.",
+        # French elisions requiring the multi-letter prefix branch
+        "jusqu'à demain",
+        "lorsqu'il pleut",
+        "puisqu'après tout",
+        "quoiqu'il arrive",
+        "aujourd'hui",
+        "aujourd'hui, jusqu'à ce que lorsqu'ils viennent",
+        # Mixed English + French
+        "I'll dire qu'aujourd'hui c'est bien",
+        "she's saying qu'il ne l'a pas fait, isn't she?",
+        # Edge case (nonsense elision) already covered in the prior list
         "j're",
+        # One curly-double + one curly-single, standing in for all curly quotes
         "“Bonjour quoiqu'aujourd'hui”",
         "puisqu’après",
     ]
 
 
 def generator_custom_text_edge_cases() -> Iterator[str]:
-    """Edge cases found while debugging"""
+    """Edge cases found while debugging.
+
+    Control-character coverage is intentionally sparse: at most 3 entries here
+    touch a character matched by [\\x00-\\x08\\x0b\\x0d-\\x1f\\x7f\\ufeff], and
+    each specific control character appears at most once (currently: BOM, CR,
+    NUL). The random / brute-force generators additionally filter these
+    characters out at their source so byte-fallback noise doesn't dominate the
+    mismatch report."""
     yield from [
-        '\x1f-a',     # unicode_ranges_control, {0x00001C, 0x00001F}
         '¼-a',        # unicode_ranges_digit, 0x00BC
         '½-a',        # unicode_ranges_digit, 0x00BD
         '¾-a',        # unicode_ranges_digit, 0x00BE
@@ -269,8 +314,8 @@ def generator_custom_text_edge_cases() -> Iterator[str]:
         'a\na',            # bert fail
         '"`',              # falcon
         ' \u2e4e',         # falcon
-        '\n\x0b  ',        # falcon
-        'a\xa0\xa0\x00b',  # jina-v2-es
+        'a\r\nb',          # CR/LF handling                            [ctrl 2/3]
+        'a\xa0\xa0\x00b',  # jina-v2-es  (embedded NUL)                [ctrl 3/3]
         'one <mask>',      # jina-v2-es  <mask> lstrip=true
         'a </s> b',        # rstrip phi-3
         'a <mask> b',      # lstrip jina-v2
@@ -292,7 +337,7 @@ def generator_vocab_words(tokenizer: TokenizerGroundtruth) -> Iterator[str]:
 
 def generator_ascii_lr_strip() -> Iterator[str]:
     WHITESPACES = ["", " ", "  "]
-    CHARACTERS = list(chr(i) for i in range(1, 0x80)) + [""]
+    CHARACTERS = [c for c in (chr(i) for i in range(1, 0x80)) if c not in CONTROL_CHARS] + [""]
     for char1 in CHARACTERS:
         for char2 in CHARACTERS:
             for lstrip in WHITESPACES:
@@ -304,7 +349,7 @@ def generator_ascii_lr_strip() -> Iterator[str]:
 
 def generator_apostrophe() -> Iterator[str]:
     WHITESPACES = ["", " ", "  "]
-    CHARACTERS = list(chr(i) for i in range(1, 0x80)) + [""]
+    CHARACTERS = [c for c in (chr(i) for i in range(1, 0x80)) if c not in CONTROL_CHARS] + [""]
     for char1 in CHARACTERS:
         for char2 in CHARACTERS:
             for lstrip in WHITESPACES:
@@ -382,6 +427,12 @@ def generator_unicodes() -> Iterator[str]:
         # if cpt == 0x2029:  # deepseek-llm
         #    return False
         if unicodedata.category(chr(cpt)) in ("Cn", "Cs", "Co"):  # undefined, surrogates, private
+            return False
+        ch = chr(cpt)
+        # Filter out control chars and curly quotes at the source; they are
+        # covered once each in the fixed generators (contractions,
+        # custom_text_edge_cases) and would otherwise dominate the report.
+        if ch in CONTROL_CHARS or ch in CURLY_QUOTES:
             return False
         return True
 

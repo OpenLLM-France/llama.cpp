@@ -9809,6 +9809,7 @@ def set_vocab_luciole(self):
             tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
             self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
             self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
+            # self.gguf_writer.add_tokenizer_pre("llama-bpe") # bloom, qwen2, llama-bpe ?
         else:
             tokens = self._set_vocab_bpe_as_spm()
             self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
