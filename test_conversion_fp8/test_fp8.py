@@ -95,14 +95,16 @@ def generate_hf(model, tok, prompt_text: str, max_new_tokens: int) -> Generation
 
 
 def generate_vllm(model_dir: Path, prompts: list[str], max_new_tokens: int,
-                  gpu_memory_utilization: float = 0.5) -> list[Generation]:
+                  gpu_memory_utilization: float = 0.5,
+                  max_model_len: int = 4096) -> list[Generation]:
     from vllm import LLM, SamplingParams
-    logger.info("loading %s in vLLM (gpu_memory_utilization=%.2f) ...",
-                model_dir, gpu_memory_utilization)
+    logger.info("loading %s in vLLM (gpu_memory_utilization=%.2f, max_model_len=%d) ...",
+                model_dir, gpu_memory_utilization, max_model_len)
     llm = LLM(
         model=str(model_dir),
         dtype="auto",
         gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
     )
     tok = llm.get_tokenizer()
     outputs = llm.generate(
@@ -153,6 +155,37 @@ def compare(label_a: str, gens_a: list[Generation], label_b: str, gens_b: list[G
     return all_pass
 
 
+def _fit_vllm_util(desired: float, safety: float = 0.9) -> float:
+    """Shrink gpu_memory_utilization to what is actually free on device 0.
+
+    vLLM's `gpu_memory_utilization` is a fraction of *total* device memory,
+    not of free memory, and it refuses to start if it can't reserve that
+    much. On unified-memory boxes (DGX Spark) the "free" fraction of the
+    120 GB pool can be well below the requested 0.5 when other processes
+    (or the OS page cache) are holding memory. Cap the fraction at
+    (free/total)*safety so vLLM always has a small headroom over what it
+    is guaranteed to obtain. Returns the desired value untouched when
+    CUDA is unavailable or the query fails."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return desired
+        free, total = torch.cuda.mem_get_info(0)
+    except Exception:
+        return desired
+    if total <= 0:
+        return desired
+    max_util = (free / total) * safety
+    if max_util >= desired:
+        return desired
+    logger.warning(
+        "shrinking vLLM gpu_memory_utilization %.2f -> %.2f "
+        "(free=%.1f GiB, total=%.1f GiB, safety=%.2f)",
+        desired, max_util, free / 2**30, total / 2**30, safety,
+    )
+    return max_util
+
+
 def _release_cuda_memory() -> None:
     """Drop the caching allocator's block pool back to the driver.
 
@@ -197,7 +230,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5,
                    help="fraction of GPU memory vLLM is allowed to reserve at startup. "
                         "Default 0.5 is conservative and safe when the transformers run "
-                        "in the same process still holds cache. Raise to 0.9 on a dedicated GPU.")
+                        "in the same process still holds cache. Raise to 0.9 on a dedicated GPU. "
+                        "Automatically shrunk to fit actual free memory when needed.")
+    p.add_argument("--vllm-max-model-len", type=int, default=4096,
+                   help="max context length passed to vLLM. Smaller = less KV cache reserved. "
+                        "Default 4096 is plenty for the short-generation checks this test does; "
+                        "raise it only if a specific prompt/generation is longer.")
     p.add_argument("--max-new-tokens", type=int, default=30, help="tokens generated per prompt (default: 30)")
     p.add_argument("--num-prompts", type=int, default=3, help="number of prompts sampled from the pool (default: 3)")
     p.add_argument("--min-agreement", type=float, default=0.85,
@@ -255,10 +293,23 @@ def main() -> int:
 
     if args.vllm:
         _release_cuda_memory()
+        util = _fit_vllm_util(args.vllm_gpu_memory_utilization)
+        # A vLLM engine that reserves less than ~5% of a large unified pool
+        # cannot hold even a small model + kv-cache, so bail out with a clear
+        # message rather than letting vLLM emit an obscure allocator failure.
+        if util < 0.05:
+            logger.error(
+                "only ~%.1f%% of GPU memory is currently free — vLLM cannot "
+                "start with usable headroom. Free memory (kill other CUDA "
+                "processes; drop OS page cache) and retry.",
+                util * 100,
+            )
+            return 2
         try:
             vllm_gens = generate_vllm(
                 args.fp8, fp8_prompts, args.max_new_tokens,
-                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                gpu_memory_utilization=util,
+                max_model_len=args.vllm_max_model_len,
             )
         except ImportError:
             logger.error("vLLM is not installed. `pip install vllm` and retry.")
