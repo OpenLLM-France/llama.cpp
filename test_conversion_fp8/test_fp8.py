@@ -54,8 +54,81 @@ class Generation:
     token_ids: list[int]
 
 
+def _make_mamba_cpu_safe() -> None:
+    """Route mamba_ssm's gated-RMSNorm through its own pure-torch reference on CPU.
+
+    Nemotron-H's `torch_forward` (the CPU-friendly branch) still routes its
+    gated RMSNorm through mamba_ssm's Triton kernel, which raises
+    'Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)' on
+    CPU tensors. Dispatch: CUDA inputs → original Triton kernel; CPU inputs →
+    `rms_norm_ref`, the reference implementation shipped in the same module.
+
+    Called at the top of `load_hf_model`, before any modeling module imports
+    `rmsnorm_fn`, so the local binding picks up the wrapper. Idempotent."""
+    import inspect
+    try:
+        from mamba_ssm.ops.triton import layernorm_gated
+    except ImportError:
+        return
+    if getattr(layernorm_gated, "_cpu_safe_patched", False):
+        return
+
+    _orig_rmsnorm_fn = layernorm_gated.rmsnorm_fn
+    _rms_norm_ref = layernorm_gated.rms_norm_ref
+    # Older mamba_ssm rmsnorm_fn is 7 params (no is_rms_norm — hard-coded True
+    # since this is the RMS variant); newer takes 8. Detect once so we only
+    # forward args the installed version accepts.
+    _orig_supports_is_rms_norm = (
+        "is_rms_norm" in inspect.signature(_orig_rmsnorm_fn).parameters
+    )
+
+    def rmsnorm_fn_dispatch(x, weight, bias=None, z=None, eps=1e-6,
+                            group_size=None, norm_before_gate=True,
+                            is_rms_norm=True):
+        if x.is_cuda:
+            if _orig_supports_is_rms_norm:
+                return _orig_rmsnorm_fn(x, weight, bias, z, eps, group_size,
+                                        norm_before_gate, is_rms_norm)
+            return _orig_rmsnorm_fn(x, weight, bias, z, eps, group_size,
+                                    norm_before_gate)
+        return _rms_norm_ref(x, weight, bias, z, eps, group_size,
+                             norm_before_gate, is_rms_norm)
+
+    layernorm_gated.rmsnorm_fn = rmsnorm_fn_dispatch
+    layernorm_gated._cpu_safe_patched = True
+
+
+def _make_cuda_stream_cpu_safe() -> None:
+    """Make `torch.cuda.default_stream` accept CPU devices.
+
+    Nemotron-H's custom modeling wraps its Mamba path in
+    `with torch.cuda.stream(torch.cuda.default_stream(hidden_states.device)):`
+    unconditionally. On CPU, `default_stream("cpu")` raises
+    `ValueError: Expected a cuda device`. `torch.cuda.stream(None)` is already
+    a no-op context, so we only need to make `default_stream` return None on
+    non-CUDA devices. Idempotent."""
+    import torch
+    if getattr(torch.cuda, "_cpu_safe_patched", False):
+        return
+    _orig_default_stream = torch.cuda.default_stream
+
+    def default_stream(device=None):
+        if device is not None:
+            try:
+                if torch.device(device).type != "cuda":
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return _orig_default_stream(device)
+
+    torch.cuda.default_stream = default_stream
+    torch.cuda._cpu_safe_patched = True
+
+
 def load_hf_model(model_dir: Path, device: str = "auto"):
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    _make_cuda_stream_cpu_safe()
+    _make_mamba_cpu_safe()
     logger.info("loading %s (device=%s) ...", model_dir, device)
     tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     kw = dict(dtype="auto", trust_remote_code=True)
@@ -105,6 +178,7 @@ def generate_vllm(model_dir: Path, prompts: list[str], max_new_tokens: int,
         dtype="auto",
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
+        trust_remote_code=True,
     )
     tok = llm.get_tokenizer()
     outputs = llm.generate(
@@ -207,6 +281,37 @@ def _release_cuda_memory() -> None:
         pass
 
 
+def _wait_cuda_memory_stable(max_wait_s: float = 5.0,
+                             poll_interval_s: float = 0.2) -> None:
+    """Poll `mem_get_info` until free memory stops growing, or timeout.
+
+    torch.cuda.empty_cache() releases blocks *asynchronously*; the CUDA driver
+    may take several hundred milliseconds to fully unmap. If vLLM spawns its
+    engine subprocess while the parent is still draining, vLLM's first memory
+    snapshot is lower than the memory available during its later profiling
+    call, and it fails with:
+        AssertionError: Error in memory profiling.
+        Initial free memory X, current free memory Y.
+        (Y > X → the parent kept releasing.)
+    Wait for two consecutive stable readings before letting vLLM start."""
+    import time
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    prev = -1
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        free, _ = torch.cuda.mem_get_info(0)
+        if free == prev:
+            return
+        prev = free
+        time.sleep(poll_interval_s)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     try:
@@ -293,6 +398,7 @@ def main() -> int:
 
     if args.vllm:
         _release_cuda_memory()
+        _wait_cuda_memory_stable()
         util = _fit_vllm_util(args.vllm_gpu_memory_utilization)
         # A vLLM engine that reserves less than ~5% of a large unified pool
         # cannot hold even a small model + kv-cache, so bail out with a clear

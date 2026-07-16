@@ -84,9 +84,15 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 # so --no-build-isolation is required (else pip's ephemeral build env has no
 # torch/CUDA). On arm64 there are no prebuilt wheels, so this compiles from
 # source with nvcc — slow (~20-30 min on GB10) but rarely changes.
+# mamba-ssm is installed from git main (not PyPI): the released wheel still
+# ships a Triton kernel (_chunk_cumsum_fwd_kernel in ssd_chunk_state.py) that
+# fails to specialize a dict argument under the Triton bundled with torch
+# cu128 on Blackwell (sm_121). Symptom at first forward:
+#   TypeError: failed to specialize argument of type: dict
+# git main has the fix.
 RUN pip3 install --break-system-packages --no-cache-dir --no-build-isolation \
         "causal-conv1d>=1.4.0" \
-        mamba-ssm
+        "git+https://github.com/state-spaces/mamba.git"
 
 # vLLM for FP8 serving and for the test_conversion_fp8 --vllm cross-check.
 # On arm64 there are no prebuilt vLLM wheels, so this compiles from source
@@ -103,7 +109,18 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 # background when it isn't already reachable, provided this binary is on PATH.
 # Placed as the last install layer. Ollama publishes as .tar.zst (zstd) since
 # ~v0.31 — no more .tgz — hence the apt install of zstd and tar's --zstd flag.
-RUN apt-get update && apt-get install -y --no-install-recommends zstd \
+# Rewrite `http://` to `https://` on Ubuntu mirrors before any apt call, so
+# `apt-get update` works from networks that block plain-HTTP egress (common in
+# managed environments; the base image ships DEB822 sources pointing at
+# `http://ports.ubuntu.com/ubuntu-ports/` and would otherwise hang). Also
+# bundles `less` (interactive log paging) into the same apt hop as `zstd` so
+# we don't need a second network round-trip.
+RUN find /etc/apt -type f \( -name '*.sources' -o -name '*.list' \) -exec sed -i \
+        -e 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+        -e 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' \
+        -e 's|http://security.ubuntu.com|https://security.ubuntu.com|g' \
+        {} + \
+ && apt-get update && apt-get install -y --no-install-recommends zstd less \
  && rm -rf /var/lib/apt/lists/* \
  && arch=$(uname -m) \
  && case "$arch" in x86_64) o=amd64 ;; aarch64) o=arm64 ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac \

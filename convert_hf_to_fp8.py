@@ -66,6 +66,30 @@ VISION_IGNORE_PATTERNS = [
 ]
 
 
+# Model families whose Mamba/SSM projections we skip during FP8 quantization.
+# The Mamba mixer's in_proj/out_proj feed into a stateful recurrent update
+# whose numerics are markedly more sensitive to weight quantization than
+# plain attention/MLP layers. Skipping them recovers most of the quality on
+# hybrid models at negligible size cost (Mamba layers are ~5-10% of params).
+MAMBA_HYBRID_MODEL_TYPES = ("nemotron_h", "nemotron-h", "bamba", "zamba", "zamba2", "jamba")
+
+
+def _mamba_hybrid_ignore_patterns(config) -> list[str]:
+    """Build regex ignore patterns targeting Mamba layers of a hybrid model.
+
+    Uses config.hybrid_override_pattern (a string like 'M-M-M*-M-...' where
+    each char = one layer: M=Mamba, -=MLP, *=Attention) to target only the
+    Mamba-position layers by index. Falls back to a broad name-based glob
+    when the pattern is missing."""
+    pattern = getattr(config, "hybrid_override_pattern", None) or ""
+    mamba_indices = [i for i, c in enumerate(pattern) if c == "M"]
+    if not mamba_indices:
+        return ["re:.*(mamba|ssm)\\..*", "re:.*\\.mixer\\.(in_proj|out_proj)$"]
+    # Nemotron-H / similar layer path is backbone.layers.<i>.mixer.<projection>.
+    # Anchor on `.<i>.` so `.10.` does not also match `.1.` etc.
+    return [f"re:.*\\.layers\\.{i}\\.mixer\\..*" for i in mamba_indices]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a HuggingFace transformers model to FP8 (compressed-tensors)"
@@ -178,6 +202,17 @@ def parse_args() -> argparse.Namespace:
             "(FP8_DYNAMIC is a data-free / weight-only pass, so no forward runs) "
             "and is the reliable fallback when GPU quantization OOMs. Requires "
             "roughly 2 x (model size in bytes) of RAM. 'auto' = cuda if available."
+        ),
+    )
+    parser.add_argument(
+        "--skip-mamba-fp8", action="store_true",
+        help=(
+            "for hybrid Mamba-Transformer models (Nemotron-H, Bamba, Jamba, Zamba…), "
+            "keep every Linear inside the Mamba mixer at the original precision. "
+            "Standard practice quantizes Mamba's in_proj/out_proj to FP8 just like "
+            "attention/MLP; this flag is stricter and useful if that hurts quality "
+            "on a specific model. llmcompressor's targets='Linear' already spares "
+            "the causal conv1d and the SSM state parameters regardless."
         ),
     )
 
@@ -345,10 +380,27 @@ def main() -> int:
 
     config = AutoConfig.from_pretrained(model_ref, trust_remote_code=True)
     is_multimodal = looks_multimodal(config.to_dict())
+    model_type = (getattr(config, "model_type", "") or "").lower()
+    is_mamba_hybrid = model_type in MAMBA_HYBRID_MODEL_TYPES
 
     ignore = ["lm_head"]
     if is_multimodal:
         ignore.extend(VISION_IGNORE_PATTERNS)
+    if args.skip_mamba_fp8:
+        if not is_mamba_hybrid:
+            logger.warning(
+                "--skip-mamba-fp8 was passed but model_type=%r is not in the "
+                "known Mamba-hybrid list %s; extra Mamba ignores skipped.",
+                model_type, list(MAMBA_HYBRID_MODEL_TYPES),
+            )
+        else:
+            mamba_patterns = _mamba_hybrid_ignore_patterns(config)
+            ignore.extend(mamba_patterns)
+            logger.info(
+                "--skip-mamba-fp8: keeping every Linear in %d Mamba layer(s) "
+                "of %s at original precision",
+                len(mamba_patterns), model_type,
+            )
 
     device = args.device
     if device == "auto":

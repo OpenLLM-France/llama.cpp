@@ -104,7 +104,16 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 # background when it isn't already reachable, provided this binary is on PATH.
 # Placed as the last install layer. Ollama publishes as .tar.zst (zstd) since
 # ~v0.31 — no more .tgz — hence the apt install of zstd and tar's --zstd flag.
-RUN apt-get update && apt-get install -y --no-install-recommends zstd \
+# Rewrite `http://` to `https://` on Ubuntu mirrors before any apt call, so
+# `apt-get update` works from networks that block plain-HTTP egress (common in
+# managed environments). Also bundles `less` (interactive log paging) into the
+# same apt hop as `zstd` so we don't need a second network round-trip.
+RUN find /etc/apt -type f \( -name '*.sources' -o -name '*.list' \) -exec sed -i \
+        -e 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+        -e 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' \
+        -e 's|http://security.ubuntu.com|https://security.ubuntu.com|g' \
+        {} + \
+ && apt-get update && apt-get install -y --no-install-recommends zstd less \
  && rm -rf /var/lib/apt/lists/* \
  && arch=$(uname -m) \
  && case "$arch" in x86_64) o=amd64 ;; aarch64) o=arm64 ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac \
