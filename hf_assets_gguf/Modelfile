@@ -1,5 +1,5 @@
 # Modelfile to be used with "ollama"
-# adapt "./<name>-Q4_K_M.gguf" with the path where you copy the GGUF file of Luciole-1B-Instruct-1.2 model
+# adapt "./<name>-Q4_K_M.gguf" with the path where you copy the GGUF file
 
 FROM ./<name>-Q4_K_M.gguf
 PARAMETER seed 1234
@@ -9,60 +9,6 @@ PARAMETER top_k 20
 PARAMETER top_p 0.95
 PARAMETER min_p 0.1
 SYSTEM "You are a helpful AI assistant named Luciole, trained by LINAGORA and OpenLLM France."
-TEMPLATE """{{- if or .System .Tools }}<|im_start|>system
-{{ if .System }}{{ .System }}
-{{- else }}You are a helpful AI assistant named Luciole, trained by LINAGORA and OpenLLM France.
-{{- end }}
-{{- if .Tools }}
-
-# Tools
-
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{{- range .Tools }}
-{{ . }}
-{{- end }}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>
-{{- end }}<|im_end|>
-{{ end }}
-{{- range $i, $_ := .Messages }}
-{{- $last := eq (len (slice $.Messages $i)) 1 -}}
-{{- if eq .Role "user" }}<|im_start|>user
-{{ .Content }}<|im_end|>
-{{ else if eq .Role "assistant" }}<|im_start|>assistant
-{{- if .Content }}
-{{ .Content }}
-{{- end }}
-{{- if .ToolCalls }}
-{{- range .ToolCalls }}
-<tool_call>
-{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
-</tool_call>
-{{- end }}
-{{- end }}{{ if not $last }}<|im_end|>
-{{ end }}
-{{- else if eq .Role "tool" }}
-{{- $prevRole := "" }}
-{{- range slice $.Messages 0 $i }}{{- $prevRole = .Role }}{{- end }}
-{{- $nextRole := "" }}
-{{- range $j, $m := slice $.Messages $i }}{{- if eq $j 1 }}{{- $nextRole = $m.Role }}{{- end }}{{- end }}
-{{- if ne $prevRole "tool" }}<|im_start|>user{{ end }}
-<tool_response>
-{{ .Content }}
-</tool_response>
-{{- if ne $nextRole "tool" }}<|im_end|>
-{{ end }}
-{{- end }}
-{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
-{{ end }}
-{{- end }}"""
 PARAMETER stop "<|im_end|>"
 PARAMETER stop "<|im_start|>"
 PARAMETER stop "<pad>"

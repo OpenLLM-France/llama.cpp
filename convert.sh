@@ -7,6 +7,7 @@ usage() {
 Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
                        [--complete] [--test-vocab] [--transformers-fp8]
                        [--renderer NAME] [--parser NAME]
+                       [--thinking | --no-thinking]
 
   input_folder         HF-format model directory to convert
   --name NAME          basename used for output files (default: basename of input_folder)
@@ -16,10 +17,20 @@ Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
   --transformers-fp8   also run convert_hf_to_fp8.py; FP8 output goes to
                        <input_folder>-FP8, or <output_folder>/FP8 if --output is set
   --renderer NAME      Ollama Modelfile RENDERER directive (overrides auto-detect)
-  --parser NAME        Ollama Modelfile PARSER directive (overrides auto-detect)
-                       When neither is given, NemotronH* architectures default to
-                       RENDERER qwen3-vl-instruct + PARSER passthrough to bypass
-                       Ollama's hardcoded nemotron-3-nano template (spurious <think>).
+  --parser NAME        Ollama Modelfile PARSER directive   (overrides auto-detect)
+  --thinking           treat the model as thinking-capable (overrides auto-detect)
+  --no-thinking        treat the model as non-thinking      (overrides auto-detect)
+
+Auto-detected defaults for the Ollama directives (both overridable):
+
+              regular Nemotron            NemotronH*
+  non-thinking  (none)                    RENDERER=qwen3-vl-instruct
+                                          PARSER=passthrough
+  thinking      RENDERER=qwen3-vl-thinking (defensive: Ollama's Jinja engine may
+                PARSER=qwen3-vl-thinking    choke on {%- generation %} blocks)
+
+  Thinking auto-detected by looking for </think> in chat_template.jinja or
+  tokenizer_config.json's chat_template field.
 EOF
     exit 1
 }
@@ -33,6 +44,8 @@ OLLAMA_RENDERER=""
 OLLAMA_PARSER=""
 OLLAMA_RENDERER_SET=0
 OLLAMA_PARSER_SET=0
+IS_THINKING=""
+IS_THINKING_SET=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,6 +57,8 @@ while [ $# -gt 0 ]; do
         --transformers-fp8)  RUN_FP8=1;                            shift ;;
         --renderer)          OLLAMA_RENDERER=$2; OLLAMA_RENDERER_SET=1; shift 2 ;;
         --parser)            OLLAMA_PARSER=$2;   OLLAMA_PARSER_SET=1;   shift 2 ;;
+        --thinking)          IS_THINKING=1; IS_THINKING_SET=1;     shift ;;
+        --no-thinking)       IS_THINKING=0; IS_THINKING_SET=1;     shift ;;
         --)                  shift;                                break ;;
         -*) echo "unknown option: $1" >&2; usage ;;
         *)
@@ -84,24 +99,78 @@ STRIP_CHAT_TEMPLATE=0
 # F16 is the de-facto base; BF16 is safer for models trained in bf16.
 BASE_TYPE="bf16"
 
-# Detect the HF architecture from config.json, if any (used to auto-select
-# an Ollama-safe RENDERER/PARSER pair for hybrid Nemotron-H — otherwise
-# Ollama's built-in nemotron-3-nano renderer injects a spurious <think>
-# and mis-labels every token as "thinking" content).
+# Detect the HF architecture from config.json, if any.
 HF_ARCH=""
 if [ -f "$INPUT_PATH/config.json" ]; then
     HF_ARCH=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); a=d.get('architectures') or ['']; print(a[0])" "$INPUT_PATH/config.json" 2>/dev/null || echo "")
 fi
 
-# Auto-populate the two Modelfile directives when the caller left them unset
-# AND the model is a NemotronH* variant. Passing --renderer/--parser (even to
-# an empty string) suppresses this so the user can force a different choice.
+# Detect whether the source has a thinking-capable chat template.
+# The naive "contains </think>" check misfires: non-thinking templates that
+# support parsing legacy thinking-annotated history (Luciole's non-thinking
+# variant does exactly this) contain '</think>' inside a split() call in
+# their assistant-parsing branch. Signals that are actually distinctive:
+#   1. `enable_thinking` — the API toggle standard HF thinking templates
+#      expose; absent from non-thinking variants.
+#   2. `<think>\n\n</think>` — the empty-thought fenced block emitted when
+#      thinking is disabled at render time; only thinking templates emit it.
+# Either signal is enough. --thinking / --no-thinking overrides on the CLI.
+if [ $IS_THINKING_SET -eq 0 ]; then
+    IS_THINKING=$(python3 - "$INPUT_PATH" <<'PY' 2>/dev/null || echo 0
+import json, os, sys
+p = sys.argv[1]
+tmpl = ""
+jinja = os.path.join(p, "chat_template.jinja")
+if os.path.isfile(jinja):
+    with open(jinja) as f:
+        tmpl = f.read()
+else:
+    tc = os.path.join(p, "tokenizer_config.json")
+    if os.path.isfile(tc):
+        try:
+            with open(tc) as f:
+                tmpl = json.load(f).get("chat_template", "") or ""
+        except Exception:
+            pass
+is_thinking = "enable_thinking" in tmpl or "<think>\\n\\n</think>" in tmpl
+print(1 if is_thinking else 0)
+PY
+)
+fi
+
+# Case matrix for the two Ollama Modelfile directives (only applied when the
+# caller hasn't overridden them via --renderer/--parser):
+#
+#              regular Nemotron       NemotronH*
+# non-thinking (none)                  qwen3-vl-instruct / passthrough
+# thinking     qwen3-vl-thinking       qwen3-vl-thinking / qwen3-vl-thinking
+#              / qwen3-vl-thinking     (both same)
+#
+# For the thinking case we also route away from Ollama's built-in Jinja engine
+# even on regular nemotron, because Luciole's thinking template uses
+# {%- generation %} / {%- endgeneration %} blocks that Ollama's Jinja support
+# has historically been shaky on.
 case "$HF_ARCH" in
     NemotronHForCausalLM|NemotronHForConditionalGeneration|NemotronH*)
-        [ $OLLAMA_RENDERER_SET -eq 0 ] && OLLAMA_RENDERER="qwen3-vl-instruct"
-        [ $OLLAMA_PARSER_SET   -eq 0 ] && OLLAMA_PARSER="passthrough"
+        if [ "$IS_THINKING" = "1" ]; then
+            [ $OLLAMA_RENDERER_SET -eq 0 ] && OLLAMA_RENDERER="qwen3-vl-thinking"
+            [ $OLLAMA_PARSER_SET   -eq 0 ] && OLLAMA_PARSER="qwen3-vl-thinking"
+        else
+            [ $OLLAMA_RENDERER_SET -eq 0 ] && OLLAMA_RENDERER="qwen3-vl-instruct"
+            [ $OLLAMA_PARSER_SET   -eq 0 ] && OLLAMA_PARSER="passthrough"
+        fi
+        ;;
+    NemotronForCausalLM|Nemotron*)
+        if [ "$IS_THINKING" = "1" ]; then
+            [ $OLLAMA_RENDERER_SET -eq 0 ] && OLLAMA_RENDERER="qwen3-vl-thinking"
+            [ $OLLAMA_PARSER_SET   -eq 0 ] && OLLAMA_PARSER="qwen3-vl-thinking"
+        fi
+        # non-thinking regular nemotron: no override needed — Ollama routes
+        # to llama-server's /v1/chat/completions and llama.cpp applies the
+        # GGUF's Jinja template cleanly.
         ;;
 esac
+echo "[detect] HF_ARCH=$HF_ARCH IS_THINKING=$IS_THINKING RENDERER=${OLLAMA_RENDERER:-(none)} PARSER=${OLLAMA_PARSER:-(none)}"
 
 # Calibration text for importance matrix (imatrix).
 # Required for IQ1_*, IQ2_*, IQ3_XXS and recommended for all other quants
@@ -300,9 +369,10 @@ else
 fi
 
 # Copy model-card assets into the output folder, substituting <name> -> $NAME
-# in the two text templates. Binary assets (logos, etc.) are copied verbatim.
-# For Modelfile, additionally inject RENDERER/PARSER lines after the FROM
-# directive when OLLAMA_RENDERER / OLLAMA_PARSER are set.
+# in text templates. Binary assets (logos, etc.) are copied verbatim.
+# For the Modelfile, additionally inject RENDERER/PARSER lines after the FROM
+# directive when OLLAMA_RENDERER / OLLAMA_PARSER are set (thinking-vs-not is
+# encoded in those two directives, so a single Modelfile template covers both).
 ASSETS_DIR="$SRCDIR/hf_assets_gguf"
 if [ -d "$ASSETS_DIR" ]; then
     for src in "$ASSETS_DIR"/*; do
