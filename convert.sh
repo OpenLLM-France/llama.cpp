@@ -6,6 +6,7 @@ usage() {
     cat <<EOF
 Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
                        [--complete] [--test-vocab] [--transformers-fp8]
+                       [--renderer NAME] [--parser NAME]
 
   input_folder         HF-format model directory to convert
   --name NAME          basename used for output files (default: basename of input_folder)
@@ -14,6 +15,11 @@ Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
   --test-vocab         only build a vocab-only GGUF and exit, sets TEST_VOCAB=1
   --transformers-fp8   also run convert_hf_to_fp8.py; FP8 output goes to
                        <input_folder>-FP8, or <output_folder>/FP8 if --output is set
+  --renderer NAME      Ollama Modelfile RENDERER directive (overrides auto-detect)
+  --parser NAME        Ollama Modelfile PARSER directive (overrides auto-detect)
+                       When neither is given, NemotronH* architectures default to
+                       RENDERER qwen3-vl-instruct + PARSER passthrough to bypass
+                       Ollama's hardcoded nemotron-3-nano template (spurious <think>).
 EOF
     exit 1
 }
@@ -23,6 +29,10 @@ NAME=""
 OUTPUT_PATH=""
 OUTPUT_SPECIFIED=0
 RUN_FP8=0
+OLLAMA_RENDERER=""
+OLLAMA_PARSER=""
+OLLAMA_RENDERER_SET=0
+OLLAMA_PARSER_SET=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -32,6 +42,8 @@ while [ $# -gt 0 ]; do
         --complete)          COMPLETE=1;                           shift ;;
         --test-vocab)        TEST_VOCAB=1;                         shift ;;
         --transformers-fp8)  RUN_FP8=1;                            shift ;;
+        --renderer)          OLLAMA_RENDERER=$2; OLLAMA_RENDERER_SET=1; shift 2 ;;
+        --parser)            OLLAMA_PARSER=$2;   OLLAMA_PARSER_SET=1;   shift 2 ;;
         --)                  shift;                                break ;;
         -*) echo "unknown option: $1" >&2; usage ;;
         *)
@@ -71,6 +83,25 @@ STRIP_CHAT_TEMPLATE=0
 # Base type used as source for all quantizations.
 # F16 is the de-facto base; BF16 is safer for models trained in bf16.
 BASE_TYPE="bf16"
+
+# Detect the HF architecture from config.json, if any (used to auto-select
+# an Ollama-safe RENDERER/PARSER pair for hybrid Nemotron-H — otherwise
+# Ollama's built-in nemotron-3-nano renderer injects a spurious <think>
+# and mis-labels every token as "thinking" content).
+HF_ARCH=""
+if [ -f "$INPUT_PATH/config.json" ]; then
+    HF_ARCH=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); a=d.get('architectures') or ['']; print(a[0])" "$INPUT_PATH/config.json" 2>/dev/null || echo "")
+fi
+
+# Auto-populate the two Modelfile directives when the caller left them unset
+# AND the model is a NemotronH* variant. Passing --renderer/--parser (even to
+# an empty string) suppresses this so the user can force a different choice.
+case "$HF_ARCH" in
+    NemotronHForCausalLM|NemotronHForConditionalGeneration|NemotronH*)
+        [ $OLLAMA_RENDERER_SET -eq 0 ] && OLLAMA_RENDERER="qwen3-vl-instruct"
+        [ $OLLAMA_PARSER_SET   -eq 0 ] && OLLAMA_PARSER="passthrough"
+        ;;
+esac
 
 # Calibration text for importance matrix (imatrix).
 # Required for IQ1_*, IQ2_*, IQ3_XXS and recommended for all other quants
@@ -270,13 +301,34 @@ fi
 
 # Copy model-card assets into the output folder, substituting <name> -> $NAME
 # in the two text templates. Binary assets (logos, etc.) are copied verbatim.
+# For Modelfile, additionally inject RENDERER/PARSER lines after the FROM
+# directive when OLLAMA_RENDERER / OLLAMA_PARSER are set.
 ASSETS_DIR="$SRCDIR/hf_assets_gguf"
 if [ -d "$ASSETS_DIR" ]; then
     for src in "$ASSETS_DIR"/*; do
         [ -e "$src" ] || continue
         dst="$OUTPUT_PATH/$(basename "$src")"
         case "$(basename "$src")" in
-            Modelfile|README.md)
+            Modelfile)
+                awk -v NAME="$NAME" \
+                    -v RENDERER="$OLLAMA_RENDERER" \
+                    -v PARSER="$OLLAMA_PARSER" '
+                    { gsub(/<name>/, NAME) }
+                    /^FROM / && !injected {
+                        print
+                        if (RENDERER != "") print "RENDERER " RENDERER
+                        if (PARSER   != "") print "PARSER "   PARSER
+                        injected = 1
+                        next
+                    }
+                    { print }
+                ' "$src" > "$dst"
+                note=""
+                [ -n "$OLLAMA_RENDERER" ] && note="$note, RENDERER=$OLLAMA_RENDERER"
+                [ -n "$OLLAMA_PARSER"   ] && note="$note, PARSER=$OLLAMA_PARSER"
+                echo "[assets] wrote $dst (<name> -> $NAME${note})"
+                ;;
+            README.md)
                 sed "s|<name>|$NAME|g" "$src" > "$dst"
                 echo "[assets] wrote $dst (with <name> -> $NAME)"
                 ;;
