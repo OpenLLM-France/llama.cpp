@@ -2948,6 +2948,18 @@ class LlamaModel(TextModel):
         if self.is_mistral_format:
             return self._set_vocab_mistral()
 
+        # OpenLLM-France Luciole/Lucie ship a Metaspace BPE tokenizer with byte
+        # fallback and no SentencePiece model. The default path below would
+        # export it as SPM with flat -1000 scores, erasing the merge hierarchy
+        # (Lucie-Training#3); route it through the dedicated writer that
+        # rebuilds the scores from the merge ranks instead.
+        #
+        # The Llama-based Lucie tokenizer uses Metaspace prepend_scheme="always"
+        # (a `▁` after every special token), so it wants add_space_prefix=True —
+        # unlike the Nemotron-based Luciole models (prepend_scheme="first").
+        if is_luciole_metaspace_bpe(self.dir_model):
+            return set_vocab_luciole(self, add_space_prefix=True)
+
         path_tekken_json = self.dir_model / "tekken.json"
         path_tokenizer_json = self.dir_model / "tokenizer.json"
         if path_tekken_json.is_file() and not path_tokenizer_json.is_file():
@@ -9783,7 +9795,55 @@ class ChatGLMModel(TextModel):
 
 
 LUCIOLE_TO_BPE = False
-def set_vocab_luciole(self):
+
+
+def is_luciole_metaspace_bpe(dir_model: Path) -> bool:
+    """Detect the OpenLLM-France Luciole/Lucie tokenizer.
+
+    It is a Metaspace BPE tokenizer (spaces encoded as ``▁``) with byte
+    fallback, shipped only as ``tokenizer.json`` (no SentencePiece
+    ``tokenizer.model``). That is exactly the shape that llama.cpp's default
+    Llama vocab path (``_set_vocab_llama_hf``) mishandles: it exports the vocab
+    as SPM ("llama") with every merge-rank score flattened to ``-1000``, which
+    erases the BPE merge hierarchy and makes GGUF engines tokenize ~36% of
+    strings differently from the HF reference
+    (see OpenLLM-France/Lucie-Training#3). Routing it through
+    ``set_vocab_luciole`` / ``_set_vocab_bpe_as_spm`` instead reconstructs the
+    scores from the merge ranks so the tokenization matches.
+
+    The check is deliberately based on the tokenizer *shape* rather than the
+    model architecture, so it fires for both the Llama-based (Lucie-7B) and the
+    Nemotron-based Luciole models, and never for ordinary Llama tokenizers:
+    Llama 1/2 ship a ``tokenizer.model`` (handled by SentencePiece), and
+    Llama 3 is byte-level BPE without byte fallback (handled by the gpt2 path).
+    """
+    if (dir_model / "tokenizer.model").is_file():
+        return False  # genuine SentencePiece model → default SPM path is correct
+    tokenizer_json = dir_model / "tokenizer.json"
+    if not tokenizer_json.is_file():
+        return False
+    try:
+        with open(tokenizer_json, encoding="utf-8") as f:
+            tj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    model = tj.get("model") or {}
+    if model.get("type") != "BPE":
+        return False
+    if not model.get("byte_fallback", False):
+        return False  # e.g. Llama 3 byte-level BPE → gpt2 path is correct
+    if model.get("ignore_merges", False):
+        return False  # Llama 3 style
+    # Require a Metaspace decoder step (spaces represented as ▁).
+    decoder = tj.get("decoder") or {}
+    if decoder.get("type") == "Sequence":
+        steps = decoder.get("decoders", [])
+    else:
+        steps = [decoder]
+    return any((step or {}).get("type") == "Metaspace" for step in steps)
+
+
+def set_vocab_luciole(self, add_space_prefix=False):
     # Luciole
     # Promote every entry of added_tokens_decoder to an atomic token, even those
     # flagged "special": false in tokenizer_config.json (e.g. <tool_call>,
@@ -9807,23 +9867,38 @@ def set_vocab_luciole(self):
     try:
         if LUCIOLE_TO_BPE:
             tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
-            self.gguf_writer.add_pad_token_id(tokens.index("<pad>"))
-            self.gguf_writer.add_unk_token_id(tokens.index("<unk>"))
+            pad_tok, unk_tok = "<pad>", "<unk>"
             # self.gguf_writer.add_tokenizer_pre("llama-bpe") # bloom, qwen2, llama-bpe ?
         else:
             tokens = self._set_vocab_bpe_as_spm()
-            self.gguf_writer.add_pad_token_id(tokens.index(b"<pad>"))
-            self.gguf_writer.add_unk_token_id(tokens.index(b"<unk>"))
+            pad_tok, unk_tok = b"<pad>", b"<unk>"
+        if pad_tok in tokens:
+            self.gguf_writer.add_pad_token_id(tokens.index(pad_tok))
+        if unk_tok in tokens:
+            self.gguf_writer.add_unk_token_id(tokens.index(unk_tok))
     finally:
         self.does_token_look_special = original_does_token_look_special
-    # add_space_prefix=False because HF's metaspace prepend_scheme="first"
-    # only inserts `▁` at the very start of the input, while llama.cpp's flag
-    # is binary and would insert `▁` after EVERY special token (so
-    # <|im_start|>system → '<|im_start|>', '▁system' instead of the expected
-    # '<|im_start|>', 'system'). Since the model is only ever fed chat-
-    # templated inputs with many special-token boundaries, the per-boundary
-    # divergence is much more harmful than the raw-text leading-space miss.
-    self.gguf_writer.add_add_space_prefix(False)
+    # add_space_prefix depends on the tokenizer's Metaspace prepend_scheme:
+    #
+    #   * Luciole (Nemotron / NemotronH) uses prepend_scheme="first": `▁` is
+    #     inserted only at the very start of the whole input. llama.cpp's flag
+    #     is binary and True would insert `▁` after EVERY special token (so
+    #     <|im_start|>system → '<|im_start|>', '▁system' instead of the
+    #     expected '<|im_start|>', 'system'). Since the model is only ever fed
+    #     chat-templated inputs with many special-token boundaries, that
+    #     per-boundary divergence is more harmful than the leading-space miss,
+    #     so we pass False.
+    #
+    #   * Lucie (Llama) uses prepend_scheme="always": `▁` is inserted at the
+    #     start of every segment, including right after each special token —
+    #     which is exactly what add_add_space_prefix(True) reproduces, so the
+    #     caller passes add_space_prefix=True.
+    #
+    # Note: Lucie's tokenizer additionally inserts spaces after line breaks and
+    # apostrophes via normalizer Replace rules. Those cannot be reproduced from
+    # the conversion script alone (they would require changes to llama.cpp's
+    # tokenizer), so they remain a known, minor divergence.
+    self.gguf_writer.add_add_space_prefix(add_space_prefix)
 
 
 @ModelBase.register("NemotronForCausalLM")
