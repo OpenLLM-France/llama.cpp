@@ -35,11 +35,17 @@ SRCDIR = Path(__file__).resolve().parent
 def pick_gguf_file(gguf_dir: Path) -> Path | None:
     if not gguf_dir.is_dir():
         return None
-    candidates = sorted(
+    all_gguf = [
         p for p in gguf_dir.glob("*.gguf")
-        if "imatrix" not in p.name.lower() and "vocab" not in p.name.lower()
-    )
-    return candidates[0] if candidates else None
+        if "imatrix" not in p.name.lower()
+    ]
+    # Prefer a full model file, but the tokenizer test only needs the vocab,
+    # so fall back to a vocab-only GGUF when that is all that is available.
+    non_vocab = sorted(p for p in all_gguf if "vocab" not in p.name.lower())
+    if non_vocab:
+        return non_vocab[0]
+    vocab = sorted(all_gguf)
+    return vocab[0] if vocab else None
 
 
 def run(label: str, cmd: list[str]) -> bool:
