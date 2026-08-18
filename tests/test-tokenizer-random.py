@@ -204,6 +204,15 @@ class TokenizerLlamaCpp (Tokenizer):
         return self.model.detokenize(ids, remove_special=False, unparse_special=True)
 
 
+def generator_plain_sentences() -> Iterator[str]:
+    """A couple of plain sentences, always tokenized raw (never wrapped in a
+    chat template), tested first as a quick sanity check."""
+    yield from [
+        "HELLO WORLD",
+        "The quick brown fox jumps over the lazy dog.",
+    ]
+
+
 def generator_custom_text() -> Iterator[str]:
     """General tests"""
     yield from [
@@ -671,6 +680,9 @@ def main(argv: list[str] | None = None):
         f"(tokenizer {'has' if has_template else 'has NO'} template; "
         f"--chat_template={args.chat_template})"
     )
+
+    # Plain-sentence sanity check, always raw (no chat template), in both modes.
+    compare_tokenizers(tokenizer1, tokenizer2, generator_plain_sentences())
 
     if not use_chat_template:
         compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text())
