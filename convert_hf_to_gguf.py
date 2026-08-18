@@ -1490,6 +1490,9 @@ class TextModel(ModelBase):
         if chkhsh == "e4d54df1ebc1f2b91acd986c5b51aa50837d5faf7c7398e73c1f9e9ee5d19869":
             # ref: https://huggingface.co/kakaocorp/kanana-2-30b-a3b-instruct-2601
             res = "kanana2"
+        if chkhsh == "5f9861fd826d8e124b222f41f41b928e78d8f6c8fbdf25625d06cc1e8736662c":
+            # ref: https://huggingface.co/OpenLLM-France/Luciole-1B-Base
+            res = "qwen2"
 
         if res is None:
             logger.warning("\n")
@@ -1515,15 +1518,187 @@ class TextModel(ModelBase):
     def _set_vocab_none(self) -> None:
         self.gguf_writer.add_tokenizer_model("none")
 
-    def _set_vocab_gpt2(self) -> None:
+    @staticmethod
+    def _gpt2_bytes_to_unicode() -> dict[int, str]:
+        # Returns the GPT-2 byte-to-unicode mapping: each byte (0-255) maps to a
+        # printable unicode character. Printable ASCII and Latin-1 supplement bytes
+        # map to themselves; remaining bytes are shifted to 256+.
+        # This is the same as openai/gpt-2's bytes_to_unicode().
+        bs = list(range(ord("!"), ord("~") + 1)) + list(range(0xA1, 0xAC + 1)) + list(range(0xAE, 0xFF + 1))
+        cs = list(bs)
+        n = 0
+        for b in range(256):
+            if b not in bs:
+                bs.append(b)
+                cs.append(256 + n)
+                n += 1
+        return dict(zip(bs, (chr(c) for c in cs)))
+
+    def _set_vocab_gpt2(self, convert_metaspace_to_gpt2=False) -> None:
         tokens, toktypes, tokpre = self.get_vocab_base()
+
+        if convert_metaspace_to_gpt2:
+            # The tokenizer uses raw UTF-8 with Metaspace (▁ for spaces), but
+            # the "gpt2" tokenizer model in llama.cpp expects GPT-2 byte encoding
+            # (where each byte is mapped to a printable unicode char, e.g. space -> Ġ).
+            # Convert all tokens: replace ▁ back to space, then apply GPT-2 byte encoding.
+            byte_encoder = self._gpt2_bytes_to_unicode()
+            seen: set[str] = set()
+            for i, token in enumerate(tokens):
+                if toktypes[i] in (gguf.TokenType.NORMAL, gguf.TokenType.USER_DEFINED):
+                    if token == " ":
+                        # Useless token in Luciole
+                        encoded = "".join(byte_encoder[b] for b in "\u2581".encode("utf-8"))
+                    else:
+                        encoded = "".join(byte_encoder[b] for b in token.replace("\u2581", " ").encode("utf-8"))
+                    assert encoded not in seen, f"Unexpected collision in GPT-2 byte encoding: {encoded!r} for '{token}'"
+                    seen.add(encoded)
+                    tokens[i] = encoded
+                else: # gguf.TokenType.CONTROL
+                    print("NOCOMMIT", i, token, toktypes[i])
+                    assert token not in seen, f"Unexpected collision in GPT-2 byte encoding: {token}"
+                    seen.add(token)
+
         self.gguf_writer.add_tokenizer_model("gpt2")
         self.gguf_writer.add_tokenizer_pre(tokpre)
         self.gguf_writer.add_token_list(tokens)
         self.gguf_writer.add_token_types(toktypes)
-
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        if convert_metaspace_to_gpt2:
+            special_vocab.merges = [
+                " ".join(
+                    "".join(byte_encoder[b] for b in part.replace("\u2581", " ").encode("utf-8"))
+                    for part in merge.split(" ")
+                )
+                for merge in special_vocab.merges
+            ]
         special_vocab.add_to_gguf(self.gguf_writer)
+        return tokens
+
+    def _set_vocab_bpe_as_spm(self) -> None:
+        """Convert a HuggingFace BPE tokenizer (with Metaspace ▁) to SPM format for llama.cpp.
+
+        This reads the vocab from tokenizer.json, keeps tokens in their original
+        UTF-8 form (with ▁ preserved), assigns scores from merge ranks, and adds
+        byte fallback tokens <0x00>-<0xFF> required by the SPM tokenizer in C++.
+        """
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
+
+        reverse_vocab = {id_: tok for tok, id_ in tokenizer.vocab.items()}
+        added_vocab = tokenizer.get_added_vocab()
+        added_tokens_decoder = tokenizer.added_tokens_decoder
+
+        # Build merge rank lookup: token_text -> rank (lower rank = merged earlier = higher priority)
+        merge_ranks: dict[str, int] = {}
+        merges_file = self.dir_model / "tokenizer.json"
+        if merges_file.is_file():
+            import json as _json
+            with open(merges_file, "r", encoding="utf-8") as f:
+                tokenizer_json = _json.load(f)
+            merges = tokenizer_json.get("model", {}).get("merges", [])
+            for rank, merge in enumerate(merges):
+                # merge can be "token_a token_b" (str) or ["token_a", "token_b"] (list)
+                parts = merge.split(" ") if isinstance(merge, str) else merge
+                merged_token = "".join(parts)
+                if merged_token not in merge_ranks:
+                    merge_ranks[merged_token] = rank
+
+        # Prepare token arrays
+        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+        scores: list[float] = [-10000.0] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+
+        # Track which byte values are covered (for byte fallback)
+        byte_token_ids: dict[int, int] = {}
+
+        for token_id in range(vocab_size):
+            if token_id not in reverse_vocab:
+                continue
+
+            token_text = reverse_vocab[token_id]
+
+            if token_id in added_tokens_decoder:
+                info = added_tokens_decoder[token_id]
+                if info.special or self.does_token_look_special(token_text):
+                    tokens[token_id] = token_text.encode("utf-8")
+                    scores[token_id] = 0.0
+                    # USER_DEFINED instead of CONTROL: USER_DEFINED tokens are
+                    # always pre-extracted atomically by llama.cpp's tokenizer
+                    # (see llama-vocab.cpp:tokenizer_st_partition), whereas
+                    # CONTROL tokens are only matched when the caller passes
+                    # parse_special=true. Some runtimes (notably Ollama in
+                    # /api/generate raw=true mode) leave parse_special=false,
+                    # which would BPE-split tokens like <|im_start|> into ~12
+                    # pieces. USER_DEFINED avoids that and matches HF behavior.
+                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+                    continue
+
+            # Check if this is a byte fallback token (<0xHH>) or a single-byte token
+            import re as _re
+            raw_bytes = token_text.encode("utf-8")
+            byte_match = _re.fullmatch(r"<0x([0-9A-Fa-f]{2})>", token_text)
+            if byte_match:
+                byte_val = int(byte_match.group(1), 16)
+                byte_token_ids[byte_val] = token_id
+                tokens[token_id] = token_text.encode("utf-8")
+                scores[token_id] = -10000.0
+                toktypes[token_id] = SentencePieceTokenTypes.BYTE
+                continue
+            elif len(raw_bytes) == 1:
+                byte_token_ids[raw_bytes[0]] = token_id
+
+            # Assign score based on merge rank or token_id
+            if token_text in merge_ranks:
+                # Merged tokens: earlier merges get higher (less negative) scores
+                # Use negative rank so that rank 0 (first merge) gets highest score
+                score = -float(merge_ranks[token_text])
+            else:
+                # Base tokens (single chars) get high scores; unknown tokens get low scores
+                if len(raw_bytes) == 1:
+                    score = 0.0
+                else:
+                    score = -10000.0 + float(token_id)
+
+            tokens[token_id] = raw_bytes
+            scores[token_id] = score
+            toktypes[token_id] = SentencePieceTokenTypes.NORMAL
+
+        # Add byte fallback tokens for any missing byte values
+        # SPM in llama.cpp requires <0x00> through <0xFF> with BYTE type
+        next_pad_idx = 0
+        for byte_val in range(256):
+            if byte_val in byte_token_ids:
+                continue  # already handled above
+            hex_str = f"<0x{byte_val:02X}>"
+            if byte_val in byte_token_ids:
+                tid = byte_token_ids[byte_val]
+                tokens[tid] = hex_str.encode("utf-8")
+                toktypes[tid] = SentencePieceTokenTypes.BYTE
+                scores[tid] = -10000.0
+            else:
+                # Find an unused PAD slot
+                while next_pad_idx < len(tokens) and toktypes[next_pad_idx] != SentencePieceTokenTypes.UNUSED:
+                    next_pad_idx += 1
+                if next_pad_idx < vocab_size:
+                    tokens[next_pad_idx] = hex_str.encode("utf-8")
+                    toktypes[next_pad_idx] = SentencePieceTokenTypes.BYTE
+                    scores[next_pad_idx] = -10000.0
+                    next_pad_idx += 1
+                else:
+                    logger.warning(f"No room to add byte fallback token {hex_str}")
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+        return tokens
 
     def _set_vocab_qwen(self):
         dir_model = self.dir_model
@@ -2772,6 +2947,18 @@ class LlamaModel(TextModel):
 
         if self.is_mistral_format:
             return self._set_vocab_mistral()
+
+        # OpenLLM-France Luciole/Lucie ship a Metaspace BPE tokenizer with byte
+        # fallback and no SentencePiece model. The default path below would
+        # export it as SPM with flat -1000 scores, erasing the merge hierarchy
+        # (Lucie-Training#3); route it through the dedicated writer that
+        # rebuilds the scores from the merge ranks instead.
+        #
+        # The Llama-based Lucie tokenizer uses Metaspace prepend_scheme="always"
+        # (a `▁` after every special token), so it wants add_space_prefix=True —
+        # unlike the Nemotron-based Luciole models (prepend_scheme="first").
+        if is_luciole_metaspace_bpe(self.dir_model):
+            return set_vocab_luciole(self, add_space_prefix=True)
 
         path_tekken_json = self.dir_model / "tekken.json"
         path_tokenizer_json = self.dir_model / "tokenizer.json"
@@ -9607,14 +9794,124 @@ class ChatGLMModel(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+LUCIOLE_TO_BPE = False
+
+
+def is_luciole_metaspace_bpe(dir_model: Path) -> bool:
+    """Detect the OpenLLM-France Luciole/Lucie tokenizer.
+
+    It is a Metaspace BPE tokenizer (spaces encoded as ``▁``) with byte
+    fallback, shipped only as ``tokenizer.json`` (no SentencePiece
+    ``tokenizer.model``). That is exactly the shape that llama.cpp's default
+    Llama vocab path (``_set_vocab_llama_hf``) mishandles: it exports the vocab
+    as SPM ("llama") with every merge-rank score flattened to ``-1000``, which
+    erases the BPE merge hierarchy and makes GGUF engines tokenize ~36% of
+    strings differently from the HF reference
+    (see OpenLLM-France/Lucie-Training#3). Routing it through
+    ``set_vocab_luciole`` / ``_set_vocab_bpe_as_spm`` instead reconstructs the
+    scores from the merge ranks so the tokenization matches.
+
+    The check is deliberately based on the tokenizer *shape* rather than the
+    model architecture, so it fires for both the Llama-based (Lucie-7B) and the
+    Nemotron-based Luciole models, and never for ordinary Llama tokenizers:
+    Llama 1/2 ship a ``tokenizer.model`` (handled by SentencePiece), and
+    Llama 3 is byte-level BPE without byte fallback (handled by the gpt2 path).
+    """
+    if (dir_model / "tokenizer.model").is_file():
+        return False  # genuine SentencePiece model → default SPM path is correct
+    tokenizer_json = dir_model / "tokenizer.json"
+    if not tokenizer_json.is_file():
+        return False
+    try:
+        with open(tokenizer_json, encoding="utf-8") as f:
+            tj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    model = tj.get("model") or {}
+    if model.get("type") != "BPE":
+        return False
+    if not model.get("byte_fallback", False):
+        return False  # e.g. Llama 3 byte-level BPE → gpt2 path is correct
+    if model.get("ignore_merges", False):
+        return False  # Llama 3 style
+    # Require a Metaspace decoder step (spaces represented as ▁).
+    decoder = tj.get("decoder") or {}
+    if decoder.get("type") == "Sequence":
+        steps = decoder.get("decoders", [])
+    else:
+        steps = [decoder]
+    return any((step or {}).get("type") == "Metaspace" for step in steps)
+
+
+def set_vocab_luciole(self, add_space_prefix=False):
+    # Luciole
+    # Promote every entry of added_tokens_decoder to an atomic token, even those
+    # flagged "special": false in tokenizer_config.json (e.g. <tool_call>,
+    # </tool_call>, <tool_response>, </tool_response>). _set_vocab_bpe_as_spm
+    # then marks them USER_DEFINED, which means llama.cpp pre-extracts them
+    # atomically regardless of the runtime's parse_special flag — important
+    # because Ollama's /api/generate raw=true mode runs with parse_special=false
+    # and would otherwise BPE-split <|im_start|> into ~12 byte tokens.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+    added_token_texts = {info.content for info in tokenizer.added_tokens_decoder.values()}
+    original_does_token_look_special = self.does_token_look_special
+
+    def does_token_look_special_with_added(token):
+        token_text = token.decode("utf-8") if isinstance(token, (bytes, bytearray)) else token
+        if token_text in added_token_texts:
+            return True
+        return original_does_token_look_special(token)
+
+    self.does_token_look_special = does_token_look_special_with_added
+    try:
+        if LUCIOLE_TO_BPE:
+            tokens = self._set_vocab_gpt2(convert_metaspace_to_gpt2=True)
+            pad_tok, unk_tok = "<pad>", "<unk>"
+            # self.gguf_writer.add_tokenizer_pre("llama-bpe") # bloom, qwen2, llama-bpe ?
+        else:
+            tokens = self._set_vocab_bpe_as_spm()
+            pad_tok, unk_tok = b"<pad>", b"<unk>"
+        if pad_tok in tokens:
+            self.gguf_writer.add_pad_token_id(tokens.index(pad_tok))
+        if unk_tok in tokens:
+            self.gguf_writer.add_unk_token_id(tokens.index(unk_tok))
+    finally:
+        self.does_token_look_special = original_does_token_look_special
+    # add_space_prefix depends on the tokenizer's Metaspace prepend_scheme:
+    #
+    #   * Luciole (Nemotron / NemotronH) uses prepend_scheme="first": `▁` is
+    #     inserted only at the very start of the whole input. llama.cpp's flag
+    #     is binary and True would insert `▁` after EVERY special token (so
+    #     <|im_start|>system → '<|im_start|>', '▁system' instead of the
+    #     expected '<|im_start|>', 'system'). Since the model is only ever fed
+    #     chat-templated inputs with many special-token boundaries, that
+    #     per-boundary divergence is more harmful than the leading-space miss,
+    #     so we pass False.
+    #
+    #   * Lucie (Llama) uses prepend_scheme="always": `▁` is inserted at the
+    #     start of every segment, including right after each special token —
+    #     which is exactly what add_add_space_prefix(True) reproduces, so the
+    #     caller passes add_space_prefix=True.
+    #
+    # Note: Lucie's tokenizer additionally inserts spaces after line breaks and
+    # apostrophes via normalizer Replace rules. Those cannot be reproduced from
+    # the conversion script alone (they would require changes to llama.cpp's
+    # tokenizer), so they remain a known, minor divergence.
+    self.gguf_writer.add_add_space_prefix(add_space_prefix)
+
+
 @ModelBase.register("NemotronForCausalLM")
 class NemotronModel(TextModel):
     model_arch = gguf.MODEL_ARCH.NEMOTRON
 
     def set_vocab(self):
-        self._set_vocab_sentencepiece()
-        self.gguf_writer.add_pad_token_id(0)
-        self.gguf_writer.add_unk_token_id(1)
+        if (self.dir_model / "tokenizer.model").is_file():
+            self._set_vocab_sentencepiece()
+            self.gguf_writer.add_pad_token_id(0)
+            self.gguf_writer.add_unk_token_id(1)
+        else:
+            set_vocab_luciole(self)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -9642,8 +9939,24 @@ class NemotronModel(TextModel):
         #   model.layers.{l}.input_layernorm.weight
         #   model.layers.{l}.post_attention_layernorm.weight
         #   model.norm.weight
+        # NOTE: cast to fp32 BEFORE the +1 — source weights are bf16/fp16 and the
+        # add would otherwise happen at the source dtype, quantizing γ by ~3.9e-3
+        # (bf16) / ~9.8e-4 (fp16) per element. GGUF stores these tensors as F32,
+        # so doing the arithmetic at full precision is free.
         if name.endswith("norm.weight"):
-            data_torch = data_torch + 1
+            data_torch = data_torch.float() + 1
+
+        # for tied embeddings, duplicate token_embd as output.weight.
+        # NOTE: upstream llama.cpp's NEMOTRON loader treats output.weight as
+        # required (unlike NEMOTRON_H, which falls back to token_embd), so the
+        # duplicate must be present in the GGUF — it costs ~vocab*n_embd bytes
+        # but is necessary for the model to load on stock llama.cpp.
+        if self.hparams.get("tie_word_embeddings", False) and name == "model.embed_tokens.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT), data_torch)
+
+        # skip lm_head.weight if tie_word_embeddings is True (already emitted from embed_tokens above)
+        if self.hparams.get("tie_word_embeddings", False) and name == "lm_head.weight":
+            return
 
         yield from super().modify_tensors(data_torch, name, bid)
 
@@ -10091,6 +10404,8 @@ class NemotronHModel(GraniteHybridModel):
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
 
+        self.is_luciole = hparams.get("bos_token_id", -1) == 0
+
         super().__init__(*args, **kwargs)
 
         # Save the top-level head_dim for later
@@ -10164,6 +10479,10 @@ class NemotronHModel(GraniteHybridModel):
                 self.gguf_writer.add_moe_latent_size(latent_size)
 
     def set_vocab(self):
+        if self.is_luciole:
+            set_vocab_luciole(self)
+            return
+
         super().set_vocab()
 
         # The tokenizer _does_ add a BOS token (via post_processor type
