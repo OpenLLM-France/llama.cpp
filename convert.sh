@@ -6,6 +6,7 @@ usage() {
     cat <<EOF
 Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
                        [--complete] [--test-vocab] [--transformers-fp8]
+                       [--transformers-fp4] [--transformers-fp4a16]
                        [--renderer NAME] [--parser NAME]
                        [--thinking | --no-thinking]
 
@@ -16,6 +17,12 @@ Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
   --test-vocab         only build a vocab-only GGUF and exit, sets TEST_VOCAB=1
   --transformers-fp8   also run convert_hf_to_fp8.py; FP8 output goes to
                        <input_folder>-FP8, or <output_folder>/FP8 if --output is set
+  --transformers-fp4   also run convert_hf_to_fp4.py (NVFP4 w4a4, for Blackwell);
+                       output goes to <input_folder>-FP4, or <output_folder>/FP4.
+                       Needs a GPU (runs a bilingual EN+FR calibration pass).
+  --transformers-fp4a16 also run convert_hf_to_fp4.py with --outtype nvfp4a16
+                       (weight-only NVFP4, data-free — no calibration, no GPU);
+                       output goes to <input_folder>-FP4A16, or <output_folder>/FP4A16.
   --renderer NAME      Ollama Modelfile RENDERER directive (overrides auto-detect)
   --parser NAME        Ollama Modelfile PARSER directive   (overrides auto-detect)
   --thinking           treat the model as thinking-capable (overrides auto-detect)
@@ -40,6 +47,8 @@ NAME=""
 OUTPUT_PATH=""
 OUTPUT_SPECIFIED=0
 RUN_FP8=0
+RUN_FP4=0
+RUN_FP4A16=0
 OLLAMA_RENDERER=""
 OLLAMA_PARSER=""
 OLLAMA_RENDERER_SET=0
@@ -55,6 +64,8 @@ while [ $# -gt 0 ]; do
         --complete)          COMPLETE=1;                           shift ;;
         --test-vocab)        TEST_VOCAB=1;                         shift ;;
         --transformers-fp8)  RUN_FP8=1;                            shift ;;
+        --transformers-fp4)  RUN_FP4=1;                            shift ;;
+        --transformers-fp4a16) RUN_FP4A16=1;                       shift ;;
         --renderer)          OLLAMA_RENDERER=$2; OLLAMA_RENDERER_SET=1; shift 2 ;;
         --parser)            OLLAMA_PARSER=$2;   OLLAMA_PARSER_SET=1;   shift 2 ;;
         --thinking)          IS_THINKING=1; IS_THINKING_SET=1;     shift ;;
@@ -423,6 +434,36 @@ if [ $RUN_FP8 -eq 1 ]; then
     # doesn't trigger a CUDA context init that OOMs on unified-memory systems
     # (DGX Spark) when other processes are already holding most of the pool.
     CMD="CUDA_VISIBLE_DEVICES= python3 convert_hf_to_fp8.py $INPUT_PATH --outfile $FP8_PATH --split-max-size 5G --device cpu"
+    echo "$CMD"
+    eval $CMD
+fi
+
+if [ $RUN_FP4 -eq 1 ]; then
+    if [ $OUTPUT_SPECIFIED -eq 1 ]; then
+        FP4_PATH=$OUTPUT_PATH/FP4
+    else
+        FP4_PATH=${INPUT_PATH}-FP4
+    fi
+    mkdir -p "$FP4_PATH"
+    # NVFP4 w4a4 quantizes activations too, so it runs a calibration forward
+    # pass (bilingual EN+FR by default) — unlike the data-free FP8 pass, this
+    # needs a GPU. Leave the GPU visible and let --device auto pick cuda.
+    CMD="python3 convert_hf_to_fp4.py $INPUT_PATH --outfile $FP4_PATH --split-max-size 5G --device auto"
+    echo "$CMD"
+    eval $CMD
+fi
+
+if [ $RUN_FP4A16 -eq 1 ]; then
+    if [ $OUTPUT_SPECIFIED -eq 1 ]; then
+        FP4A16_PATH=$OUTPUT_PATH/FP4A16
+    else
+        FP4A16_PATH=${INPUT_PATH}-FP4A16
+    fi
+    mkdir -p "$FP4A16_PATH"
+    # NVFP4A16 is weight-only and data-free (no calibration) — like FP8, no CUDA
+    # needed. Hide the GPU so the data-free pipeline doesn't init a CUDA context
+    # that OOMs on unified-memory systems (DGX Spark).
+    CMD="CUDA_VISIBLE_DEVICES= python3 convert_hf_to_fp4.py $INPUT_PATH --outfile $FP4A16_PATH --outtype nvfp4a16 --split-max-size 5G --device cpu"
     echo "$CMD"
     eval $CMD
 fi
