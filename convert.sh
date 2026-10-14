@@ -5,8 +5,8 @@ SRCDIR=$(dirname "$0")
 usage() {
     cat <<EOF
 Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
-                       [--complete] [--test-vocab] [--transformers-fp8]
-                       [--transformers-fp4] [--transformers-fp4a16]
+                       [--complete] [--test-vocab] [--skip-gguf]
+                       [--transformers-fp8] [--transformers-fp4] [--transformers-fp4a16]
                        [--renderer NAME] [--parser NAME]
                        [--thinking | --no-thinking]
 
@@ -15,6 +15,9 @@ Usage: bash convert.sh <input_folder> [--name <name>] [--output <output_folder>]
   --output DIR         output directory (default: <input_folder>-GGUF)
   --complete           full build (all standard + dynamic quants), sets COMPLETE=1
   --test-vocab         only build a vocab-only GGUF and exit, sets TEST_VOCAB=1
+  --skip-gguf          do not build any GGUF (skips the base conversion, imatrix,
+                       quants and the GGUF model-card assets). Combine with a
+                       --transformers-* flag to produce only that quantization.
   --transformers-fp8   also run convert_hf_to_fp8.py; FP8 output goes to
                        <input_folder>-FP8, or <output_folder>/FP8 if --output is set
   --transformers-fp4   also run convert_hf_to_fp4.py (NVFP4 w4a4, for Blackwell);
@@ -49,6 +52,7 @@ OUTPUT_SPECIFIED=0
 RUN_FP8=0
 RUN_FP4=0
 RUN_FP4A16=0
+SKIP_GGUF=0
 OLLAMA_RENDERER=""
 OLLAMA_PARSER=""
 OLLAMA_RENDERER_SET=0
@@ -66,6 +70,7 @@ while [ $# -gt 0 ]; do
         --transformers-fp8)  RUN_FP8=1;                            shift ;;
         --transformers-fp4)  RUN_FP4=1;                            shift ;;
         --transformers-fp4a16) RUN_FP4A16=1;                       shift ;;
+        --skip-gguf)         SKIP_GGUF=1;                          shift ;;
         --renderer)          OLLAMA_RENDERER=$2; OLLAMA_RENDERER_SET=1; shift 2 ;;
         --parser)            OLLAMA_PARSER=$2;   OLLAMA_PARSER_SET=1;   shift 2 ;;
         --thinking)          IS_THINKING=1; IS_THINKING_SET=1;     shift ;;
@@ -90,6 +95,13 @@ done
 INPUT_PATH=${INPUT_PATH%/}
 : "${NAME:=$(basename "$INPUT_PATH")}"
 : "${OUTPUT_PATH:=${INPUT_PATH}-GGUF}"
+
+# --skip-gguf only makes sense alongside a transformers quantization, otherwise
+# the run would produce nothing at all.
+if [ $SKIP_GGUF -eq 1 ] && [ $RUN_FP8 -eq 0 ] && [ $RUN_FP4 -eq 0 ] && [ $RUN_FP4A16 -eq 0 ]; then
+    echo "--skip-gguf skips the GGUF build, but no --transformers-fp8/fp4/fp4a16 was given: nothing to do." >&2
+    exit 1
+fi
 
 # Flags ------------------------------------------------------------------
 # TEST_VOCAB=1          : only build a vocab-only GGUF and exit (sanity check)
@@ -240,7 +252,11 @@ QUANTS_DYNAMIC=(
 
 # -----------------------------------------------------------------------
 
-mkdir -p "$OUTPUT_PATH"
+# The -GGUF output folder is only needed for the GGUF build; --skip-gguf leaves
+# it uncreated (the transformers-* blocks make their own output dirs).
+if [ $SKIP_GGUF -eq 0 ]; then
+    mkdir -p "$OUTPUT_PATH"
+fi
 cd "$SRCDIR"
 
 QUANTIZE=./build/bin/llama-quantize
@@ -344,12 +360,15 @@ quantize_dynamic() {
 
 # -----------------------------------------------------------------------
 
-if [ $TEST_VOCAB -eq 1 ]; then
+if [ $TEST_VOCAB -eq 1 ] && [ $SKIP_GGUF -eq 0 ]; then
     CMD="python3 convert_hf_to_gguf.py $INPUT_PATH --outfile $OUTPUT_PATH/$NAME-vocab.gguf --vocab-only"
     echo "$CMD"
     eval $CMD
     exit 0
 fi
+
+# ---- GGUF conversion (skipped entirely with --skip-gguf) ----------------
+if [ $SKIP_GGUF -eq 0 ]; then
 
 # Always build the base precision used for quantization.
 convert_hf $BASE_TYPE
@@ -420,6 +439,8 @@ if [ -d "$ASSETS_DIR" ]; then
         esac
     done
 fi
+
+fi  # ---- end GGUF conversion (--skip-gguf) ----------------------------
 
 if [ $RUN_FP8 -eq 1 ]; then
     if [ $OUTPUT_SPECIFIED -eq 1 ]; then
