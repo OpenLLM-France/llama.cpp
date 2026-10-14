@@ -9925,7 +9925,14 @@ class NemotronModel(TextModel):
         rot_pct = self.find_hparam(["partial_rotary_factor", "rope_pct", "rope_percent"])
         n_embd = self.find_hparam(["hidden_size", "n_embd"])
         n_head = self.find_hparam(["num_attention_heads", "n_head"])
-        self.gguf_writer.add_rope_dimension_count(int(rot_pct * n_embd) // n_head)
+        # Derive the RoPE dimension from head_dim, not hidden_size / n_head: the two
+        # agree for standard Nemotron but differ when head_dim is decoupled
+        # (e.g. 48 heads with head_dim=128 -> rope dim 64, not int(0.5*3840)//48 = 40).
+        # The fallback keeps standard Nemotron/Minitron models unchanged.
+        head_dim = self.find_hparam(["head_dim", "attention_head_dim"], optional=True)
+        if head_dim is None:
+            head_dim = n_embd // n_head
+        self.gguf_writer.add_rope_dimension_count(int(rot_pct * head_dim))
 
         # * RopeScaling for Nemotron
         if "rope_scaling" not in self.hparams or self.hparams["rope_scaling"] is None:
