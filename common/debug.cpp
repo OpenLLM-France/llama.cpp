@@ -3,6 +3,10 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <regex>
 #include <string>
 
 static std::string common_ggml_ne_string(const ggml_tensor * t) {
@@ -155,6 +159,53 @@ template <bool abort_on_nan> bool common_debug_cb_eval(struct ggml_tensor * t, b
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : cb_data->data.data();
         common_debug_print_tensor<abort_on_nan>(data, t->type, t->ne, t->nb, 3);
+
+        // Optional full-tensor binary dump for layer-by-layer comparison work.
+        // Activated by setting env var LLAMA_DUMP_TENSORS_FILE=/path/to/out.bin.
+        // Optionally narrow what gets dumped with LLAMA_DUMP_TENSORS_REGEX
+        // (a single regex; anchored implicitly with regex_search). If unset,
+        // every tensor that already matched cb_data's filter gets dumped.
+        // Per-tensor binary record (little-endian):
+        //     u32 name_len, char name[name_len],
+        //     u32 dtype (ggml_type), i64 ne[4],
+        //     u64 n_bytes, u8 data[n_bytes]
+        const char * dump_path = std::getenv("LLAMA_DUMP_TENSORS_FILE");
+        if (dump_path) {
+            static std::regex   dump_regex;
+            static bool         dump_regex_set = false;
+            static bool         dump_regex_valid = false;
+            if (!dump_regex_set) {
+                dump_regex_set = true;
+                const char * pat = std::getenv("LLAMA_DUMP_TENSORS_REGEX");
+                if (pat && *pat) {
+                    try { dump_regex = std::regex(pat); dump_regex_valid = true; }
+                    catch (const std::regex_error &) { dump_regex_valid = false; }
+                }
+            }
+            bool should_dump = !dump_regex_valid || std::regex_search(t->name, dump_regex);
+            if (should_dump) {
+                static FILE * dump_fout = nullptr;
+                static std::string opened_path;
+                if (!dump_fout || opened_path != dump_path) {
+                    if (dump_fout) fclose(dump_fout);
+                    dump_fout = std::fopen(dump_path, "wb");
+                    opened_path = dump_path;
+                }
+                if (dump_fout) {
+                    uint32_t name_len = (uint32_t) std::strlen(t->name);
+                    std::fwrite(&name_len, 4, 1, dump_fout);
+                    std::fwrite(t->name, 1, name_len, dump_fout);
+                    uint32_t dtype = (uint32_t) t->type;
+                    std::fwrite(&dtype, 4, 1, dump_fout);
+                    int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+                    std::fwrite(ne, 8, 4, dump_fout);
+                    uint64_t nbytes = (uint64_t) ggml_nbytes(t);
+                    std::fwrite(&nbytes, 8, 1, dump_fout);
+                    std::fwrite(data, 1, nbytes, dump_fout);
+                    std::fflush(dump_fout);
+                }
+            }
+        }
     }
 
     return true;

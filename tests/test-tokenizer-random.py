@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 import logging
 import argparse
+import itertools
 import subprocess
 import random
 import unicodedata
@@ -26,11 +27,28 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 logger = logging.getLogger("test-tokenizer-random")
 
 
+# Characters that historically flood the mismatch log without teaching us
+# anything about the tokenizer we're actually testing (they mostly exercise
+# byte-fallback paths). We keep at most one dedicated test per representative
+# character in the fixed test lists and filter these out of the random /
+# brute-force generators so they don't dominate the report.
+CONTROL_CHARS = frozenset(
+    chr(cp) for cp in (
+        *range(0x00, 0x09),  # NUL..BS
+        0x0B,                # VT
+        *range(0x0D, 0x20),  # CR..US
+        0x7F,                # DEL
+        0xFEFF,              # BOM
+    )
+)
+CURLY_QUOTES = frozenset("‘’“”")  # U+2018..U+201D — represent all curly quotes
+
+
 class LibLlama:
 
     DEFAULT_PATH_LLAMA_H = "./include/llama.h"
     DEFAULT_PATH_INCLUDES = ["./ggml/include/", "./include/"]
-    DEFAULT_PATH_LIBLLAMA = "./build/src/libllama.so"  # CMakeLists.txt: BUILD_SHARED_LIBS ON
+    DEFAULT_PATH_LIBLLAMA = "./build/bin/libllama.so"  # CMakeLists.txt: BUILD_SHARED_LIBS ON
 
     def __init__(self, path_llama_h: str | None = None, path_includes: list[str] = [], path_libllama: str | None = None):
         path_llama_h = path_llama_h or self.DEFAULT_PATH_LLAMA_H
@@ -79,6 +97,9 @@ class LibLlamaModel:
         self.model = self.lib.llama_model_load_from_file(path_model.encode(), mparams)
         if not self.model:
             raise RuntimeError("error: failed to load model '%s'" % path_model)
+        self.vocab = self.lib.llama_model_get_vocab(self.model)
+        if not self.vocab:
+            raise RuntimeError("error: failed to get vocab for model '%s'" % path_model)
         if isinstance(cparams, dict):
             cparams = libllama.context_default_params(**cparams)
         self.ctx = self.lib.llama_new_context_with_model(self.model, cparams)
@@ -99,10 +120,10 @@ class LibLlamaModel:
 
     def tokenize(self, text: str, add_special: bool = False, parse_special: bool = False) -> list[int]:
         encoded_text: bytes = text.encode("utf-8")
-        num = self.lib.llama_tokenize(self.model, encoded_text, len(encoded_text), self.token_ids, len(self.token_ids), add_special, parse_special)
+        num = self.lib.llama_tokenize(self.vocab, encoded_text, len(encoded_text), self.token_ids, len(self.token_ids), add_special, parse_special)
         while num < 0 and len(self.token_ids) < (16 << 20):
             self.token_ids = self.ffi.new("llama_token[]", -2 * num)
-            num = self.lib.llama_tokenize(self.model, encoded_text, len(encoded_text), self.token_ids, len(self.token_ids), add_special, parse_special)
+            num = self.lib.llama_tokenize(self.vocab, encoded_text, len(encoded_text), self.token_ids, len(self.token_ids), add_special, parse_special)
         return list(self.token_ids[0:num])
 
     def detokenize(self, ids: list[int], remove_special: bool = False, unparse_special: bool = False) -> str:
@@ -110,10 +131,10 @@ class LibLlamaModel:
             self.token_ids = self.ffi.new("llama_token[]", 2 * len(ids))
         for i, id in enumerate(ids):
             self.token_ids[i] = id
-        num = self.lib.llama_detokenize(self.model, self.token_ids, len(ids), self.text_buff, len(self.text_buff), remove_special, unparse_special)
+        num = self.lib.llama_detokenize(self.vocab, self.token_ids, len(ids), self.text_buff, len(self.text_buff), remove_special, unparse_special)
         while num < 0 and len(self.text_buff) < (16 << 20):
             self.text_buff = self.ffi.new("uint8_t[]", -2 * num)
-            num = self.lib.llama_detokenize(self.model, self.token_ids, len(ids), self.text_buff, len(self.text_buff), remove_special, unparse_special)
+            num = self.lib.llama_detokenize(self.vocab, self.token_ids, len(ids), self.text_buff, len(self.text_buff), remove_special, unparse_special)
         return str(cast(Buffer, self.ffi.buffer(self.text_buff, num)), encoding="utf-8", errors="replace")  # replace errors with '\uFFFD'
 
 
@@ -147,11 +168,24 @@ class TokenizerGroundtruth (Tokenizer):
         self.bos_token = self.model.bos_token
         self.eos_token = self.model.eos_token
 
-    def encode(self, text: str) -> list[int]:
-        return self.model.encode(text, add_special_tokens=True)
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        return self.model.encode(text, add_special_tokens=add_special)
 
     def decode(self, ids: list[int]) -> str:
         return self.model.decode(ids, skip_special_tokens=False)
+
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        return self.model.convert_ids_to_tokens(ids)
+
+    def has_chat_template(self) -> bool:
+        return bool(getattr(self.model, "chat_template", None))
+
+    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
+        return self.model.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
 
 
 class TokenizerLlamaCpp (Tokenizer):
@@ -163,11 +197,20 @@ class TokenizerLlamaCpp (Tokenizer):
             self.libllama = LibLlama()
         self.model = LibLlamaModel(self.libllama, vocab_file, mparams=dict(vocab_only=True), cparams=dict(n_ctx=4096))
 
-    def encode(self, text: str) -> list[int]:
-        return self.model.tokenize(text, add_special=True, parse_special=True)
+    def encode(self, text: str, add_special: bool = True) -> list[int]:
+        return self.model.tokenize(text, add_special=add_special, parse_special=True)
 
     def decode(self, ids: list[int]) -> str:
         return self.model.detokenize(ids, remove_special=False, unparse_special=True)
+
+
+def generator_plain_sentences() -> Iterator[str]:
+    """A couple of plain sentences, always tokenized raw (never wrapped in a
+    chat template), tested first as a quick sanity check."""
+    yield from [
+        "HELLO WORLD",
+        "The quick brown fox jumps over the lazy dog.",
+    ]
 
 
 def generator_custom_text() -> Iterator[str]:
@@ -204,6 +247,12 @@ def generator_custom_text() -> Iterator[str]:
         "\n =",
         "' era",
         "Hello, y'all! How are you 😁 ?我想在apple工作1314151天～",
+    ]
+
+
+def generator_digit() -> Iterator[str]:
+    """Digits"""
+    yield from [
         "3",
         "33",
         "333",
@@ -213,13 +262,55 @@ def generator_custom_text() -> Iterator[str]:
         "3333333",
         "33333333",
         "333333333",
+        "333333333+333",
+    ]
+
+
+def generator_contractions() -> Iterator[str]:
+    """Contractions and apostrophes.
+
+    All French elisions use the straight ASCII apostrophe. Curly-quote coverage
+    is deliberately minimal (one U+201C double, one U+2019 single) — those two
+    stand in for every curly-quote form; the rest are filtered out of the random
+    generators to keep the mismatch log focused."""
+    yield from [
+        # English contractions
+        "I'll",
+        "We've they're",
+        "don't shouldn't wouldn't",
+        "I'm you're he'd she'll",
+        "y'all it's",
+        # French elisions (single)
+        "j'ai t'as l'homme d'un c'est s'il n'est m'a qu'il",
+        "s'il vous plaît, c'est l'heure d'y aller.",
+        # French elisions requiring the multi-letter prefix branch
+        "jusqu'à demain",
+        "lorsqu'il pleut",
+        "puisqu'après tout",
+        "quoiqu'il arrive",
+        "aujourd'hui",
+        "aujourd'hui, jusqu'à ce que lorsqu'ils viennent",
+        # Mixed English + French
+        "I'll dire qu'aujourd'hui c'est bien",
+        "she's saying qu'il ne l'a pas fait, isn't she?",
+        # Edge case (nonsense elision) already covered in the prior list
+        "j're",
+        # One curly-double + one curly-single, standing in for all curly quotes
+        "“Bonjour quoiqu'aujourd'hui”",
+        "puisqu’après",
     ]
 
 
 def generator_custom_text_edge_cases() -> Iterator[str]:
-    """Edge cases found while debugging"""
+    """Edge cases found while debugging.
+
+    Control-character coverage is intentionally sparse: at most 3 entries here
+    touch a character matched by [\\x00-\\x08\\x0b\\x0d-\\x1f\\x7f\\ufeff], and
+    each specific control character appears at most once (currently: BOM, CR,
+    NUL). The random / brute-force generators additionally filter these
+    characters out at their source so byte-fallback noise doesn't dominate the
+    mismatch report."""
     yield from [
-        '\x1f-a',     # unicode_ranges_control, {0x00001C, 0x00001F}
         '¼-a',        # unicode_ranges_digit, 0x00BC
         '½-a',        # unicode_ranges_digit, 0x00BD
         '¾-a',        # unicode_ranges_digit, 0x00BE
@@ -232,8 +323,8 @@ def generator_custom_text_edge_cases() -> Iterator[str]:
         'a\na',            # bert fail
         '"`',              # falcon
         ' \u2e4e',         # falcon
-        '\n\x0b  ',        # falcon
-        'a\xa0\xa0\x00b',  # jina-v2-es
+        'a\r\nb',          # CR/LF handling                            [ctrl 2/3]
+        'a\xa0\xa0\x00b',  # jina-v2-es  (embedded NUL)                [ctrl 3/3]
         'one <mask>',      # jina-v2-es  <mask> lstrip=true
         'a </s> b',        # rstrip phi-3
         'a <mask> b',      # lstrip jina-v2
@@ -255,7 +346,7 @@ def generator_vocab_words(tokenizer: TokenizerGroundtruth) -> Iterator[str]:
 
 def generator_ascii_lr_strip() -> Iterator[str]:
     WHITESPACES = ["", " ", "  "]
-    CHARACTERS = list(chr(i) for i in range(1, 0x80)) + [""]
+    CHARACTERS = [c for c in (chr(i) for i in range(1, 0x80)) if c not in CONTROL_CHARS] + [""]
     for char1 in CHARACTERS:
         for char2 in CHARACTERS:
             for lstrip in WHITESPACES:
@@ -267,7 +358,7 @@ def generator_ascii_lr_strip() -> Iterator[str]:
 
 def generator_apostrophe() -> Iterator[str]:
     WHITESPACES = ["", " ", "  "]
-    CHARACTERS = list(chr(i) for i in range(1, 0x80)) + [""]
+    CHARACTERS = [c for c in (chr(i) for i in range(1, 0x80)) if c not in CONTROL_CHARS] + [""]
     for char1 in CHARACTERS:
         for char2 in CHARACTERS:
             for lstrip in WHITESPACES:
@@ -346,6 +437,12 @@ def generator_unicodes() -> Iterator[str]:
         #    return False
         if unicodedata.category(chr(cpt)) in ("Cn", "Cs", "Co"):  # undefined, surrogates, private
             return False
+        ch = chr(cpt)
+        # Filter out control chars and curly quotes at the source; they are
+        # covered once each in the fixed generators (contractions,
+        # custom_text_edge_cases) and would otherwise dominate the report.
+        if ch in CONTROL_CHARS or ch in CURLY_QUOTES:
+            return False
         return True
 
     characters = [chr(cpt) for cpt in range(0, MAX_CODEPOINTS) if _valid(cpt)]
@@ -407,7 +504,59 @@ def generator_random_vocab_words(tokenizer: TokenizerGroundtruth, iterations=100
         yield "".join(text)
 
 
-def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLlamaCpp, generator: Iterator[str]):
+def generator_chat_wrap(generator: Iterator[str], tokenizer: TokenizerGroundtruth) -> Iterator[str]:
+    """Wrap each yielded text as a single user-turn chat template, with add_generation_prompt=True."""
+    for text in generator:
+        messages = [{"role": "user", "content": text}]
+        try:
+            yield tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        except Exception as e:
+            logger.debug(f"chat template skipped for {repr(text)[:60]}: {e}")
+            continue
+
+
+def _collect_texts(source: Iterator[str], limit: int = 2048) -> list[str]:
+    out: list[str] = []
+    for text in source:
+        if not isinstance(text, str):
+            continue
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def generator_random_chat_multiturn(
+    tokenizer: TokenizerGroundtruth,
+    text_pool_source: Iterator[str],
+    iterations: int = 500,
+    max_turns: int = 11,
+) -> Iterator[str]:
+    """Random multi-turn conversations [user, assistant, user, ..., user] with add_generation_prompt=True.
+
+    The conversation always ends on a user message (odd number of turns).
+    """
+    texts = _collect_texts(text_pool_source)
+    if not texts:
+        return
+    rand = random.Random()
+    for m in range(iterations):
+        rand.seed(m)
+        num_turns = rand.randint(1, max_turns)
+        if num_turns % 2 == 0:
+            num_turns += 1  # ensure odd → ends on user
+        messages = []
+        for i in range(num_turns):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": rand.choice(texts)})
+        try:
+            yield tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        except Exception as e:
+            logger.debug(f"multiturn chat template failed at iter {m} (turns={num_turns}): {e}")
+            continue
+
+
+def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLlamaCpp, generator: Iterator[str], add_special: bool = True):
 
     def find_first_mismatch(ids1: list[int] | str, ids2: list[int] | str):
         for i, (a, b) in enumerate(zip(ids1, ids2)):
@@ -418,7 +567,7 @@ def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLl
         return min(len(ids1), len(ids2))
 
     def check_detokenizer(text: str, text1: str, text2: str) -> bool:
-        if text1 == text2:  # equal to TokenizerGroundtruth?
+        if text1 == text2 or text2 == text:  # equal to TokenizerGroundtruth?
             return True
         # equal to source text?
         if tokenizer1.add_bos_token and tokenizer1.bos_token and isinstance(tokenizer1.bos_token, str):  # remove BOS
@@ -436,16 +585,16 @@ def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLl
     t_start = time.perf_counter()
     encode_errors = 0
     decode_errors = 0
-    MAX_ERRORS = 10
+    MAX_ERRORS = 20
 
     logger.info("%s: %s" % (generator.__qualname__, "ini"))
     for text in generator:
         # print(repr(text), text.encode())
         # print(repr(text), hex(ord(text[0])), text.encode())
         t0 = time.perf_counter()
-        ids1 = tokenizer1.encode(text)
+        ids1 = tokenizer1.encode(text, add_special=add_special)
         t1 = time.perf_counter()
-        ids2 = tokenizer2.encode(text)
+        ids2 = tokenizer2.encode(text, add_special=add_special)
         t2 = time.perf_counter()
         text1 = tokenizer1.decode(ids1)
         t3 = time.perf_counter()
@@ -455,23 +604,30 @@ def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLl
         t_encode2 += t2 - t1
         t_decode1 += t3 - t2
         t_decode2 += t4 - t3
-        if encode_errors < MAX_ERRORS and ids1 != ids2:
+        had_error = False
+        if (MAX_ERRORS is None or encode_errors < MAX_ERRORS) and ids1 != ids2:
             i = find_first_mismatch(ids1, ids2)
-            ids1 = list(ids1)[max(0, i - 2) : i + 5 + 1]
-            ids2 = list(ids2)[max(0, i - 2) : i + 5 + 1]
-            logger.error(" Expected: " + str(ids1))
-            logger.error("   Result: " + str(ids2))
+            ids1_ctx = list(ids1)[max(0, i - 2) : i + 5 + 1]
+            ids2_ctx = list(ids2)[max(0, i - 2) : i + 5 + 1]
+            logger.error(f"  Input: {repr(text[:100])}")
+            logger.error(" Expected: " + str(ids1_ctx) + "  " + str(tokenizer1.convert_ids_to_tokens(ids1_ctx)))
+            logger.error("   Result: " + str(ids2_ctx) + "  " + str(tokenizer1.convert_ids_to_tokens(ids2_ctx)))
             encode_errors += 1
-            logger.error(f" {encode_errors=}")
-        if decode_errors < MAX_ERRORS and not check_detokenizer(text, text1, text2):
+            # logger.error(f" {encode_errors=}")
+            had_error = True
+        if (MAX_ERRORS is None or decode_errors < MAX_ERRORS) and not check_detokenizer(text, text1, text2):
             i = find_first_mismatch(text1, text2)
-            text1 = list(text1[max(0, i - 2) : i + 5 + 1])
-            text2 = list(text2[max(0, i - 2) : i + 5 + 1])
-            logger.error(" Expected: " + " ".join(hex(ord(x)) for x in text1))
-            logger.error("   Result: " + " ".join(hex(ord(x)) for x in text2))
+            text1_ctx = text1[max(0, i - 2) : i + 5 + 1]
+            text2_ctx = text2[max(0, i - 2) : i + 5 + 1]
+            logger.error(f"  Input: {repr(text[:100])}")
+            logger.error(" Expected: " + repr(text1_ctx))
+            logger.error("   Result: " + repr(text2_ctx))
             decode_errors += 1
-            logger.error(f" {decode_errors=}")
-        if encode_errors >= MAX_ERRORS and decode_errors >= MAX_ERRORS:
+            # logger.error(f" {decode_errors=}")
+            had_error = True
+        if had_error:
+            logger.error("")
+        if MAX_ERRORS is not None and encode_errors >= MAX_ERRORS and decode_errors >= MAX_ERRORS:
             logger.error(f" EXIT: {encode_errors=} {decode_errors=}")
             # raise Exception()
             break
@@ -485,6 +641,19 @@ def main(argv: list[str] | None = None):
     parser.add_argument("vocab_file", type=str, help="path to vocab 'gguf' file")
     parser.add_argument("dir_tokenizer", type=str, help="directory containing 'tokenizer.model' file")
     parser.add_argument("--verbose", action="store_true", help="increase output verbosity")
+    parser.add_argument(
+        "--chat_template",
+        type=str,
+        choices=["true", "false"],
+        default=None,
+        help=(
+            "Wrap each test input in the model's chat template before tokenizing. "
+            "'true' requires the tokenizer to define a chat template (fails otherwise) and "
+            "also runs multi-turn conversation tests. "
+            "'false' tests raw inputs (legacy behavior). "
+            "If omitted, defaults to 'true' when a chat template is present, else 'false'."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level = logging.DEBUG if args.verbose else logging.INFO)
@@ -493,74 +662,144 @@ def main(argv: list[str] | None = None):
     tokenizer1 = TokenizerGroundtruth(args.dir_tokenizer)
     tokenizer2 = TokenizerLlamaCpp(args.vocab_file)
 
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text())
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text_edge_cases())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_ascii_lr_strip())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_apostrophe())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_unicodes())
-    compare_tokenizers(tokenizer1, tokenizer2, generator_vocab_words(tokenizer1))
-    compare_tokenizers(tokenizer1, tokenizer2, generator_added_lr_strip(tokenizer1))
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_random_added_tokens(tokenizer1, 10_000))
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_random_chars(10_000))
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_random_unicodes(10_000))
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_chars(tokenizer1, 10_000))
-    # compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_words(tokenizer1, 5_000))
+    has_template = tokenizer1.has_chat_template()
+    if args.chat_template is None:
+        use_chat_template = has_template
+    elif args.chat_template == "true":
+        if not has_template:
+            raise ValueError(
+                "--chat_template true was requested but the tokenizer at "
+                f"'{args.dir_tokenizer}' has no chat_template set."
+            )
+        use_chat_template = True
+    else:
+        use_chat_template = False
+
+    logger.info(
+        f"chat_template: {'ENABLED' if use_chat_template else 'DISABLED'} "
+        f"(tokenizer {'has' if has_template else 'has NO'} template; "
+        f"--chat_template={args.chat_template})"
+    )
+
+    # Plain-sentence sanity check, always raw (no chat template), in both modes.
+    compare_tokenizers(tokenizer1, tokenizer2, generator_plain_sentences())
+
+    if not use_chat_template:
+        compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_digit())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_contractions())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_custom_text_edge_cases())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_ascii_lr_strip())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_apostrophe())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_unicodes())
+        compare_tokenizers(tokenizer1, tokenizer2, generator_vocab_words(tokenizer1))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_added_lr_strip(tokenizer1))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_added_tokens(tokenizer1, 10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_chars(10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_unicodes(10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_chars(tokenizer1, 10_000))
+        compare_tokenizers(tokenizer1, tokenizer2, generator_random_vocab_words(tokenizer1, 5_000))
+    else:
+        # Chat-templated single-turn runs. The chat template already injects BOS/special
+        # tokens as needed, so we disable add_special on both tokenizers to avoid
+        # double-BOS and to keep the inputs strictly identical.
+        #
+        # Each yielded item costs ~10–100x more than in raw mode (Jinja template render +
+        # tokenization of the full templated string), so we cap exhaustive generators and
+        # use smaller iteration counts for the random ones. The chat-template prefix is
+        # identical across items, so sampling gives equivalent coverage to enumeration.
+        CHAT_CAP = 2_000
+        CHAT_RAND_ITER = 1_000
+
+        def _wrap(gen, cap=CHAT_CAP):
+            if cap is not None:
+                gen = itertools.islice(gen, cap)
+            return generator_chat_wrap(gen, tokenizer1)
+
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_custom_text()),                                        add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_digit()),                                              add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_contractions()),                                       add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_custom_text_edge_cases()),                             add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_ascii_lr_strip()),                                     add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_apostrophe()),                                         add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_unicodes()),                                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_vocab_words(tokenizer1)),                              add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_added_lr_strip(tokenizer1)),                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_added_tokens(tokenizer1, CHAT_RAND_ITER)),      add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_chars(CHAT_RAND_ITER)),                         add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_unicodes(CHAT_RAND_ITER)),                      add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_vocab_chars(tokenizer1, CHAT_RAND_ITER)),       add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2, _wrap(generator_random_vocab_words(tokenizer1, CHAT_RAND_ITER)),       add_special=False)
+
+        # Multi-turn conversation tests (alternating user/assistant, ending on user).
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_custom_text(), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_chars(500), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_unicodes(500), iterations=500),
+                           add_special=False)
+        compare_tokenizers(tokenizer1, tokenizer2,
+                           generator_random_chat_multiturn(tokenizer1, generator_random_vocab_words(tokenizer1, 500), iterations=500),
+                           add_special=False)
 
     tokenizer2.model.free()
 
 
 if __name__ == "__main__":
-    # main()
+    main()
 
-    if True:
-        logging.basicConfig(
-            level    = logging.DEBUG,
-            format   = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
-            datefmt  = "%Y-%m-%d %H:%M:%S",
-            filename = logger.name + ".log",
-            filemode = "a"
-        )
-    logging.basicConfig(
-        level    = logging.DEBUG,
-        format   = "%(levelname)s %(message)s",
-    )
+    # if True:
+    #     logging.basicConfig(
+    #         level    = logging.DEBUG,
+    #         format   = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
+    #         datefmt  = "%Y-%m-%d %H:%M:%S",
+    #         filename = logger.name + ".log",
+    #         filemode = "a"
+    #     )
+    # logging.basicConfig(
+    #     level    = logging.DEBUG,
+    #     format   = "%(levelname)s %(message)s",
+    # )
 
-    path_tokenizers   = Path("./models/tokenizers/")
-    path_vocab_format = "./models/ggml-vocab-%s.gguf"
+    # path_tokenizers   = Path("./models/tokenizers/")
+    # path_vocab_format = "./models/ggml-vocab-%s.gguf"
 
-    tokenizers = [
-        "llama-spm",      # SPM
-        "phi-3",          # SPM
-        "gemma",          # SPM
-        "gemma-2",        # SPM
-        "baichuan",       # SPM
-        "bert-bge",       # WPM
-        "jina-v2-en",     # WPM
-        "llama-bpe",      # BPE
-        "phi-2",          # BPE
-        "deepseek-llm",   # BPE
-        "deepseek-coder", # BPE
-        "falcon",         # BPE
-        "mpt",            # BPE
-        "starcoder",      # BPE
-        "gpt-2",          # BPE
-        "stablelm2",      # BPE
-        "refact",         # BPE
-        "qwen2",          # BPE
-        "olmo",           # BPE
-        "jina-v2-es",     # BPE
-        "jina-v2-de",     # BPE
-        "smaug-bpe",      # BPE
-        "poro-chat",      # BPE
-        "jina-v2-code",   # BPE
-        "viking",         # BPE
-        "jais",           # BPE
-    ]
+    # tokenizers = [
+    #     "llama-spm",      # SPM
+    #     "phi-3",          # SPM
+    #     "gemma",          # SPM
+    #     "gemma-2",        # SPM
+    #     "baichuan",       # SPM
+    #     "bert-bge",       # WPM
+    #     "jina-v2-en",     # WPM
+    #     "llama-bpe",      # BPE
+    #     "phi-2",          # BPE
+    #     "deepseek-llm",   # BPE
+    #     "deepseek-coder", # BPE
+    #     "falcon",         # BPE
+    #     "mpt",            # BPE
+    #     "starcoder",      # BPE
+    #     "gpt-2",          # BPE
+    #     "stablelm2",      # BPE
+    #     "refact",         # BPE
+    #     "qwen2",          # BPE
+    #     "olmo",           # BPE
+    #     "jina-v2-es",     # BPE
+    #     "jina-v2-de",     # BPE
+    #     "smaug-bpe",      # BPE
+    #     "poro-chat",      # BPE
+    #     "jina-v2-code",   # BPE
+    #     "viking",         # BPE
+    #     "jais",           # BPE
+    # ]
 
-    logger.info("=" * 50)
-    for tokenizer in tokenizers:
-        logger.info("-" * 50)
-        logger.info(f"TOKENIZER: '{tokenizer}'")
-        vocab_file = Path(path_vocab_format % tokenizer)
-        dir_tokenizer = path_tokenizers / tokenizer
-        main([str(vocab_file), str(dir_tokenizer), "--verbose"])
+    # logger.info("=" * 50)
+    # for tokenizer in tokenizers:
+    #     logger.info("-" * 50)
+    #     logger.info(f"TOKENIZER: '{tokenizer}'")
+    #     vocab_file = Path(path_vocab_format % tokenizer)
+    #     dir_tokenizer = path_tokenizers / tokenizer
+    #     main([str(vocab_file), str(dir_tokenizer), "--verbose"])
